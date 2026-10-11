@@ -1,0 +1,10 @@
+# PlatformIO / ESP-IDF build products
+.pio/
+/CMakeLists.txt
+/sdkconfig.*
+!/sdkconfig.defaults
+!/sdkconfig.defaults.*
+/dependencies.lock
+/managed_components/
+# host build trees (any name starting with build)
+/host/build*/

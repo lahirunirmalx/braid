@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 lahiru
+# Braid partition table - ESP32-S3-WROOM-1 N8, 8 MB flash (spec 12.12:
+# "8 MB: two 3 MB OTA slots + store"). No factory slot (three 3 MB app
+# slots do not fit). Do not move offsets once devices are fielded.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x300000,
+ota_1,      app,  ota_1,    0x320000, 0x300000,
+nvs_keys,   data, nvs_keys, 0x620000, 0x1000,   encrypted
+storage,    data, spiffs,   0x621000, 0x1DF000,

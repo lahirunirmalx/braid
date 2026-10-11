@@ -1,0 +1,3 @@
+Braid test key material
+
+The key material in PROTOCOL.md Appendix A and in firmware/test/host/vectors_generated.h (K_site, K_mesh epochs and every key derived from them) is published TEST ONLY data. Anyone can reproduce it, so it protects nothing. Field builds refuse it through the test-key blacklist (spec section 12.1). Never provision it, or any key derived from it, on a deployed device.

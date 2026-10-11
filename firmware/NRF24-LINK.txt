@@ -1,0 +1,495 @@
+Braid nRF24L01+ link (PACKET carrier) - bench notes
+========================================================
+
+What it is: a third transport next to ESP-NOW and the UART link. Spec 1.2
+nRF24 row, 11.3, 11.6, 11.11, 12.4, Appendix C.5 (design) and C.6 (pins).
+32-byte Enhanced ShockBurst payloads, link-local segmentation so the node
+still sees max_frame 250 (path MTU unchanged), ESB auto-ACK unicast on
+unit-ID-derived 5-byte addresses, NO_ACK broadcast pipe for floods, fixed
+link cost 2, no RSSI.
+
+NOT YET RUN ON HARDWARE: no module was attached when this was written (the
+user may not own nRF24 modules yet). The register driver is build-only; the
+segmentation layer, the register sequence and the adapter are host-tested
+(firmware/test/host/test_nrf24_link.c, 347633 checks). Wired into
+node_app, the console and the build (see 6 for what was done and what was
+not). Treat every "expected" line as the target.
+
+
+1. Files
+--------
+
+    components/app_hal/include/hal_spi.h          generic SPI master HAL (new; no SPI HAL existed)
+    components/app_hal/include/hal_nrf24.h        radio HAL: init, addresses, payloads, status, modes
+    components/app_nrf24_link/CMakeLists.txt      ESP-IDF component (auto-discovered, builds on both chips)
+    components/app_nrf24_link/src/nrf24_seg.[ch]  segmentation + per-neighbour reassembly (portable C11)
+    components/app_nrf24_link/src/nrf24_regs.[ch] register-level chip driver, portable part (C11)
+    components/app_nrf24_link/src/nrf24_link.[ch] br_transport_t adapter (portable C11)
+    components/app_nrf24_link/src/nrf24_link_hal.[ch]  device glue: adapter radio ops -> hal_nrf24
+    components/port_esp_idf/port_spi.cpp          hal_spi over ESP-IDF spi_master (polling, no DMA)
+    components/port_esp_idf/port_nrf24.cpp        hal_nrf24: pins, CE, IRQ, delays; delegates to nrf24_regs
+    firmware/test/host/test_nrf24_link.c          host test, parts A / B / C (see 7)
+
+Layering (bottom up):
+    hal_spi (port_spi.cpp) + hal_gpio  ->  port_nrf24.cpp (nrf24_regs_io_t: spi_transfer, ce_set, delay_us)
+    -> nrf24_regs.c (register sequence, FIFOs, PRX/PTX)  ->  hal_nrf24.h API
+    -> nrf24_link_hal.c (nrf24_radio_ops_t)  ->  nrf24_link.c (queue, pump, reassembly, br_node_rx /
+       br_node_tx_status)  ->  br_node_t transport slot
+The register sequence lives in the portable nrf24_regs.c (not in the port)
+so that part B of the host test can check it against a register-model fake;
+port_nrf24.cpp is only board glue.
+
+
+2. Wiring
+---------
+
+Module: nRF24L01+ (8-pin 2x4 header). 3.3 V ONLY on VCC (5 V kills it); SPI
+pins accept 3.3 V logic (the ESP32 is 3.3 V anyway). Put 10 uF (plus 100 nF)
+directly across the module's VCC / GND pins: the chip draws 11-13 mA bursts
+in TX and brown-outs without it (the number one cause of "works on the bench,
+dies in the field"). The PA+LNA variant draws up to 115 mA on transmit and
+needs its own 3.3 V regulator (an AMS1117-3.3 fed from 5 V, 10 uF + 100 nF at
+the module), never the dev board's 3.3 V pin; keep its antenna away from the
+ESP32 antenna (12.4: separated or cross-polarised).
+
+Default pins (spec C.6 pin plans, IO_MUX pins of the SPI controller used;
+hal_nrf24_default_cfg() fills them):
+
+    signal   ESP32-WROOM-32E       ESP32-S3-WROOM-1 / -1U
+    SCK      GPIO18 (VSPI)         GPIO12 (SPI2 / FSPI)
+    MISO     GPIO19                GPIO13
+    MOSI     GPIO23                GPIO11
+    CSN      GPIO5  (see note)     GPIO10
+    CE       GPIO4                 GPIO9
+    IRQ      GPIO35 (optional)     GPIO14 (optional)   default: not used (polling)
+    VCC      3.3 V                 3.3 V
+    GND      GND                   GND
+
+    // STRAPPING: GPIO5 (ESP32 CSN) must be high at boot (SDIO slave timing
+    // strap). CSN idles high: most dev boards have a pull-up on GPIO5 and
+    // the SPI controller drives it high after init, so the strap is
+    // satisfied. Do not move CSN to GPIO0 / 2 / 12 / 15.
+    // GPIO35 is input only: fine for the IRQ (active low, the module drives
+    // it push-pull; 34-39 have no internal pulls, which is why the default
+    // is polling: an IRQ input configured without the wire floats and
+    // storms. Set nirq=35 / 14 only when the wire is there).
+
+    No collision with led=2, btn=0, the UART link (ESP32 17/16, S3 17/18),
+    S3 octal PSRAM 33-37 or USB 19/20. S3: none of the pins is strapping.
+    port_nrf24.cpp refuses flash pins (ESP32 6-11, S3 26-32), S3 33-37 and
+    19/20, strapping pins for CE / CSN other than GPIO5 CSN, and input-only
+    pins as outputs.
+
+SPI: mode 0, MSB first, 8 MHz default (10 MHz max per datasheet; 4 MHz on
+flying leads > 10 cm). CSN is driven by the SPI controller: low for the whole
+command, high between commands (required by the chip). The transaction is a
+polling one without DMA (33 bytes max), so the protocol task blocks for a
+few tens of microseconds per command.
+
+IRQ vs polling: the IRQ pin is optional and off by default. Without it the protocol task polls
+STATUS every 2 ms (cfg.poll_us) while listening and every 0.5 ms while a
+frame is in flight; with it, the ISR posts an event to the "br" queue and
+the pump runs at once. The RX FIFO is only 3 payloads deep; a neighbour's
+auto-ACK segments are retried by its ESB for ARC 15 x ARD 500 us = 7.5 ms,
+so the pump must run at least every ~5 ms while listening. Polling at 2 ms
+is enough; the IRQ lowers latency (one segment per wake-up instead of per
+poll) and is recommended for throughput.
+
+
+3. Radio settings
+-----------------
+
+    channel     76 default; 76..81 at 2 Mbps (2476-2481 MHz, above Wi-Fi
+                channel 13 and inside the 2483.5 MHz ISM limit). 82..83
+                only at 250 kbps / 1 Mbps (a 2 Mbps signal spills past
+                2483.5 MHz). The adapter accepts 0..125 but the console
+                should refuse outside 76..83 (C.5).
+    rate        2 Mbps (C.5); 1 Mbps / 250 kbps selectable (250 kbps gives
+                about 9 dB more link budget at 1/8 the throughput).
+    PA          0 dBm (max) default; -6 / -12 / -18 dBm for bench use
+                (two modules 20 cm apart at 0 dBm overload each other:
+                use PA min on the bench or put 1 m between them).
+    CRC         2 bytes (EN_CRC | CRCO), ESB requirement for auto-ACK.
+    DPL         dynamic payload length on pipes 0 and 1; RX_PW_Px = 32 as a
+                fallback.
+    EN_AA       0x03: auto-ACK on BOTH pipes, broadcast included. The
+                datasheet requires EN_AA on a pipe for dynamic payloads on
+                it; a flood is not acknowledged because the transmitter
+                writes it with W_TX_PAYLOAD_NO_ACK (FEATURE.EN_DYN_ACK),
+                which sets the NO_ACK flag in the packet so no receiver
+                replies (C.5 "Floods use W_TX_PAYLOAD_NOACK").
+    SETUP_RETR  ARD 500 us (code 1), ARC 15 (C.5): 16 attempts, 7.5 ms.
+    SETUP_AW    5 bytes.
+    Addresses   unit U: 50 4C U_hi U_lo A5 (pipe 0, own); broadcast
+                50 4C FF FF A5 (pipe 1). TX_ADDR and pipe 0 are set to the
+                destination for a unicast (the ACK comes back on pipe 0, as
+                RF24 does) and pipe 0 is restored to own when listening.
+                Byte order on the bus: see 8 (SPEC-NOTES candidates).
+
+Coexistence with the ESP-NOW mesh (12.4): mesh channel 1-6 (2412-2437 MHz),
+nRF channel 76-81 (2476-2481 MHz): > 39 MHz apart. Antennas separated or
+cross-polarised. A bridge (both radios on one board) must not start a
+transmission on one radio while the other is mid-reception of a multi-
+segment frame: nrf24_link_radio_busy() is that hook for the nRF24 side
+(true while transmitting and for 1 ms after the last segment received);
+the ESP-NOW side uses hal_radio_tx_inflight() (own TX only; ESP-NOW
+reception is invisible to the app). Cross-radio arbitration is implemented:
+firmware/RADIO-ARB.txt (SPEC-NOTES N62-N64; the nRF24 transmit gate is
+nrf24_link_set_tx_gate()). Commissioning test: compare crc_fail / reassembly drops /
+rx_frames at the bridge with the other radio idle and loaded.
+
+
+4. Segment format and reassembly (C.5, as implemented)
+-------------------------------------------------------
+
+ESB payload, 3..32 bytes:
+
+    byte 0   src        low byte of the transmitter's unit ID
+    byte 1   tag        per-transmitter frame counter, +1 per frame, wraps
+    byte 2   bit 7      LAST (1 on the final segment)
+             bits 6..0  idx (0 for the first segment)
+    3..31    payload    exactly 29 bytes on every segment except LAST
+                        (0..29 on LAST)
+
+    frame of n bytes -> ceil(n / 29) segments, 9 for 250 bytes; an empty
+    frame is one LAST segment of 3 bytes. 250 frame bytes = 8 x 32 + 21 =
+    277 payload bytes (1.1x, payload only); with preamble, address, PCF,
+    CRC and the ACKs per packet C.5's "about 1.5x on the air" holds, about
+    9 x 0.4 ms = 3.6 ms per frame at 2 Mbps with an IRQ-driven pump.
+
+Reassembly: one buffer per neighbour keyed by src (NRF24_SEG_SLOTS_DEFAULT
+4, up to 8), opened by idx 0, segments in order. Dropped whole and counted
+on: a gap (idx not the next one: gaps), another tag from the same src
+before LAST (foreign_tag), 50 ms without a segment (timeouts), > 250 bytes
+(oversize), segment 0 from a new src when every buffer is busy
+(buffer_full). Segments with idx > 0 and no open frame from that src are
+counted per segment as orphans (the tail of a dropped frame, or a frame
+whose segment 0 was lost: that frame leaves no other record). A repeat of
+the last accepted segment (same src, tag, idx) is ignored and counted as a
+dup; a LAST repeat after completion too (the ESB PID filter normally drops
+those in hardware, software sees them after a chip reset or on a NO_ACK
+copy). Two neighbours whose unit IDs share a low byte interleave into one
+buffer and the frame CRC in the node drops both (C.5 known limitation).
+
+Counters: adapter nrf24_link_stats_t (tx_queued, tx_frames, tx_unicast,
+tx_bcast, tx_segments, tx_refused, tx_bad_len, tx_max_rt, tx_stuck,
+tx_radio_err, tx_deferred, tx_status_ok / fail, rx_segments, rx_frames,
+rx_admit_drop, rx_src_mismatch, rx_bad_pipe, rx_radio_err) and reassembly
+nrf24_seg_stats_t (seg_tx, seg_rx, frames_tx, frames_rx, tx_refused,
+timeouts, gaps, orphans, foreign_tag, dups, malformed, oversize,
+buffer_full, frames_dropped). The spec's seg_fail (br_stats_t) is NOT
+incremented: the core has no hook for an adapter counter (see 6 and 8).
+
+
+5. Transmit / receive behaviour (nrf24_link.c)
+----------------------------------------------
+
+- send() queues the frame (4 frames x 250 bytes) and returns at once;
+  BR_ERR_QUEUE_FULL when full (the frame is lost and counted).
+- nrf24_link_pump(l, node, now_us) from the protocol task, outside any
+  br_node_* call: drains the RX FIFO into reassembly (each frame goes
+  br_transport_admit -> br_node_rx with the hint {address derived from the
+  header prev_hop, addr_len 5, rssi -128}), expires reassembly buffers, and
+  runs the half-duplex transmit state machine: leave PRX, program the
+  destination, send the segments one at a time (TX_DS -> next; MAX_RT ->
+  FLUSH_TX, clear, frame abandoned, br_node_tx_status(delivered = false);
+  all TX_DS -> delivered = true), back to PRX, guard 2 ms (C.5 NRF_GUARD_MS)
+  before the next frame. A frame with no TX_DS / MAX_RT within 20 ms is
+  abandoned as "stuck" (chip or CE wire fault) and reported undelivered.
+  Broadcast frames go W_TX_PAYLOAD_NO_ACK and report nothing (1.2).
+- Collision avoidance (ESB has no carrier sense): the pump does not start a
+  frame within 1 ms (cfg.rx_hold_us) of the last segment received, open
+  frame or just completed. Open: the neighbour is mid-frame to us (12.4).
+  Just completed: when our hardware ACK for its LAST segment was lost the
+  neighbour retransmits it after ARD 500 us, and only a PRX acknowledges
+  the repeat; replying at once would put both radios in PTX, both deaf,
+  until MAX_RT on both sides (seen in the host test before the hold was
+  added). The hold is shorter than the guard, so a reply always starts
+  inside the peer's guard and its first segment opens a buffer at the peer
+  before the peer's next frame is due. Two lost ACKs in a row still give a
+  head-on start and a MAX_RT pair; 11.6 counts it (3 consecutive delete the
+  link).
+- The pump returns the time it wants to run again (guard end, next status
+  poll, reassembly timeout, or now + poll_us): the task's queue wait should
+  be capped at that deadline.
+
+
+6. Console keys and integration status
+--------------------------------------
+
+Status (integration pass, 2026-10-08): the console keys below are
+implemented in node_console.c (host test test_console_links.c) with the
+pin policy of section 2 (node_nrf_pin_ok: outputs refuse input-only pins,
+strapping pins refused for all six except ncsn=5 on the ESP32; the six
+pins must be distinct from each other, from led / btn and from utx / urx
+when uart=on; nch 82..83 refused with nrate=2m). Integration items 1-6,
+8 and 10 are done: port_spi.cpp / port_nrf24.cpp are in the port build,
+app_node requires app_nrf24_link, BR_NODE_MAX_TRANSPORTS=4 image-wide
+(platformio.ini build_flags, host CMake), start_role() runs
+hal_nrf24_init() with the console's settings (HAL_ERR_HW_FAULT logs "BRNRF
+no module answering on SCK=.. MISO=.. MOSI=.. CSN=.." and the board runs
+without the link), node_init_from() registers the adapter with the same
+nbr= allowlist, br_task starts it after br_node_init() and runs the pump
+after draining the event queue and again after br_node_tick(), capping its
+queue wait at the pump's deadline; with nirq set the ISR posts a kEvtNrfIrq
+event (xQueueSendFromISR). BRSTAT adds nrf_tx= nrf_rx= nrf_seg=tx/rx
+nrf_maxrt= and the n_* drop names (n_maxrt n_stuck n_txfull n_badlen
+n_radio n_badpipe n_srcmis n_drop n_timeout n_gap n_orphan n_foreign n_dup
+n_malformed n_oversize n_full n_spi n_badwidth n_irqq); the core's seg_fail
+now counts frames_dropped through br_node_count_seg_fail() (item 8).
+BRLINK prints "via=nrf24 50:4c:01:01:a5 (esb, cost 2)". The BRNRF start
+line has no link= field (indices follow registration order: espnow, uart,
+udp, nrf24). NOT done: `br nrf` register dump (it would drive the SPI bus
+from the console task while the pump owns it; it needs a kEvt to "br"
+like `br stats`). Item 7 (bridge radio arbitration) is done: see
+firmware/RADIO-ARB.txt (SPEC-NOTES N62-N64).
+
+Keys as implemented (defaults in node_console.h):
+
+    nrf=on|off            default off
+    nch=<76..83>          default 76; 82..83 refused at 2 Mbps
+    nrate=250k|1m|2m      default 2m
+    npa=min|low|high|max  default max (-18 / -12 / -6 / 0 dBm)
+    nsck=<gpio> nmiso=<gpio> nmosi=<gpio> ncsn=<gpio> nce=<gpio> nirq=<gpio|-1>
+                          defaults per chip as in 2; pin policy of the status
+                          paragraph above (node_nrf_pin_ok: outputs refuse
+                          input-only pins, MISO / IRQ accept them, strapping
+                          refused except ncsn=5 on ESP32)
+    br nrf                NOT implemented (see status above); the counters
+                          are in BRSTAT, "BRNRF no module answering" is
+                          logged at start when init failed
+
+Integration plan as originally written (items 1-8 and 10 done, 7 as RADIO-ARB.txt; 9 n/a):
+
+ 1. components/port_esp_idf/CMakeLists.txt: add "port_spi.cpp" and
+    "port_nrf24.cpp" to SRCS; add esp_driver_spi and app_nrf24_link to
+    PRIV_REQUIRES (port_nrf24.cpp includes nrf24_regs.h). Until then the
+    two port files are not compiled by pio run; they were compile-checked
+    by hand (see 9).
+ 2. components/app_node/CMakeLists.txt: add app_nrf24_link to REQUIRES (or
+    PRIV_REQUIRES) so node_app.cpp can include nrf24_link.h and
+    nrf24_link_hal.h.
+ 3. BR_NODE_MAX_TRANSPORTS is 2 (br_node.h) and espnow + uart already fill
+    both slots on a board with uart=on. nrf24_link_register() returns
+    BR_ERR_TOO_BIG then. To run all three: -DBR_NODE_MAX_TRANSPORTS=3 in
+    platformio.ini build_flags (global: br_node_init() checks sizeof
+    (br_node_t) across translation units, so a per-component define would
+    be refused) and the same -D in firmware/host/CMakeLists.txt. Or policy:
+    nrf=on excludes uart=on on one board (bridge = espnow + nrf24).
+ 4. node_app.cpp start_role(): after hal_radio_init and before br_node_init
+    (the adapter needs no node for init), when nrf=on:
+        hal_nrf24_cfg_t nc; hal_nrf24_default_cfg(&nc); apply console
+        overrides (channel, rate, pa, pins, irq);
+        r = hal_nrf24_init(&nc);  // HAL_ERR_HW_FAULT = no module answering:
+                                  // log "BRNRF chip not answering on SCK.. MISO.. MOSI.. CSN.." and
+                                  // run without the link (same policy as BRUART init failure)
+        nrf24_link_cfg_t lc = {}; lc.unit_id = c.uid;
+        nrf24_link_register(&g_nlink, &nc_node_cfg, &lc, nrf24_link_hal_ops());
+        nc_node_cfg.transports[g_nlink.link].allowlist = tr.allowlist;  // same nbr= list (N22)
+    after br_node_init: nrf24_link_start(&g_nlink) (programs pipe 0 / 1,
+    enters PRX). Log: "BRNRF ch=76 rate=2m pa=max link=<n> PACKET
+    max_frame=250 cost=2 addr=50:4C:01:01:A5 irq=poll|GPIOnn".
+ 5. node_app.cpp br_task: call nrf24_link_pump(&g_nlink, &g_node, now)
+    after draining the event queue and after br_node_tick(); cap the queue
+    wait at min(node deadline, pump deadline). If the IRQ pin is used:
+    hal_nrf24_set_irq_cb(cb, nullptr) where cb posts a kEvtNrfIrq event
+    with xQueueSendFromISR (ISR context) and the br_task handles it by just
+    running the pump. Watchdog: the pump's SPI polling transactions are
+    tens of microseconds; nothing blocks.
+ 6. node_app.cpp stats line (BRSTAT): append nrf24_link_get_stats() /
+    nrf24_link_get_seg_stats() fields (at least tx_frames, rx_frames,
+    tx_max_rt, frames_dropped, orphans, timeouts) and hal_nrf24_get_stats().
+ 7. DONE differently, see firmware/RADIO-ARB.txt (N62-N64): espnow_link
+    defers ESP-NOW starts while nrf24_link_radio_busy(), and the nRF24 pump
+    holds frame starts while hal_radio_tx_inflight() > 0. Original text:
+    Bridge (espnow + nrf24 on one board, 12.4): before hal_radio_send(),
+    consult nrf24_link_radio_busy(&g_nlink, now) and hold the ESP-NOW frame
+    while it is true (a queue in tr_send, or defer in br_task). The reverse
+    (hold nRF24 while ESP-NOW is mid-reception) needs an "rx in progress"
+    signal from port_espnow that does not exist (ESP-NOW frames are single
+    packets, so "mid-reception" is at most one frame time, ~1 ms).
+ 8. br_node.h / br_node.c: a hook such as br_node_count_seg_fail(node) so
+    the adapter's reassembly drops reach the spec's seg_fail counter
+    (currently stays 0; the adapter keeps its own frames_dropped).
+ 9. Field build: the adapter already refuses nothing bench-specific;
+    BR_FIELD_BUILD compiles out the allowlist as everywhere else.
+10. Host CMake (firmware/host/CMakeLists.txt): nothing needed; the test is
+    picked up by the test_*.c glob and includes the three sources.
+
+
+7. Host test (firmware/test/host/test_nrf24_link.c)
+---------------------------------------------------
+
+Part A, segmentation: header layout (src / tag / idx|LAST / 29-byte
+payload, 9 segments for 250, tag increments, empty frame = 3 bytes); round
+trip of every size 0..250 and of the A.3 SEEK frame and the A.15 SEEK and
+HELLO frames; each of the 9 segments of a 250-byte frame dropped (LAST lost
+-> timeout path), duplicated (ignored), swapped with its neighbour (gap);
+whole frame repeated; two transmitters with distinct src bytes interleaved
+segment by segment; a foreign tag before LAST; the 50 ms timeout mid-frame;
+buffer-full with 2 slots and three neighbours, LRU reuse of idle slots,
+stale open buffers reclaimed by the timeout only; malformed segments and
+oversize.
+
+Part B, register driver over a register-model fake of the SPI bus: the
+init sequence (CONFIG 0x0C then 0x0E with PWR_UP last, FEATURE 0x05, DYNPD
+0x03, EN_AA 0x03, EN_RXADDR 0x03, SETUP_AW 0x03, SETUP_RETR 0x1F, RF_CH 76,
+RF_SETUP 0x0E for 2 Mbps / 0 dBm, RX_PW_Px 32, FLUSH_TX, FLUSH_RX, STATUS
+cleared before PWR_UP, CE low throughout, power-up waits); 250 kbps / 1
+Mbps / PA codes; argument checks; the ACTIVATE 0x73 fallback for non-plus
+parts; no chip wired -> NO_CHIP; address byte order (C.5 list in, LSByte
+first on the bus) for pipes 0 / 1 / 2; TX_ADDR + pipe 0 programming and
+restore on listening; W_TX_PAYLOAD vs W_TX_PAYLOAD_NO_ACK, FIFO full after
+3; CE pulse; MAX_RT recovery (FLUSH_TX, flag cleared, FIFO empty); payload
+reads with pipe / width, width > 32 flushes; channel change; power down /
+up; raw register access; bus failure -> SPI error, STATUS invalid.
+
+Part C, adapter: transport fields (PACKET, 250, rs 0, broadcast, mac_retry,
+cost 2, addr_len 5), register() fills BR_NODE_MAX_TRANSPORTS slots then
+BR_ERR_TOO_BIG, send() refusals; MAX_RT -> br_node_tx_status(delivered =
+false) with 16 attempts 500 us apart (7.5 ms), FLUSH_TX + clear, back to
+PRX, guard; broadcast frames report nothing; queue full (4); the 12.4 busy
+hook (busy for 1 ms after a segment, transmit deferred then released); a
+stuck radio (no TX_DS) abandoned after 20 ms. Then two real br_node
+instances (sender 0x0101 -> group 0xFF10, probe 0x0103; bench key, AUTH on,
+fec_m 0, ARQ on, demo MODE) through two adapters on a fake ESB medium that
+delivers 32-byte payloads with per-attempt loss, honours auto-ACK (ARC
+retries 500 us apart, PID duplicate filter, MAX_RT, payload kept until
+abort), NO_ACK, and a radio in PTX hearing nothing:
+  - clean: SEEK -> HELLO -> BIND -> MODE -> STREAMING, 20 presses (40 DATA)
+    all acknowledged, no MAX_RT, no reassembly drop, frame counts match end
+    to end, the SEEK leaves with path_mtu 250, floods NO_ACK, the probe's
+    link table holds the sender's derived address 50 4C 01 01 A5 with RSSI
+    unknown;
+  - 5 % segment and ACK loss with ESB auto-ACK (ARC 15), loss from the
+    first frame, 6 seeds: every press acknowledged, at most 2 MAX_RT per
+    run (the two-lost-ACKs head-on case), no 11.6 link deletion; the
+    reassembly drops seen are flood segments;
+  - 5 % segment loss with the ACK blind (an unacknowledged carrier: every
+    lost segment is a lost frame), armed once STREAMING, 6 seeds: every
+    DATA accounted for (all 40 acknowledged in every seed, ARQ retx 3..17),
+    reassembly drops and orphans counted, session still STREAMING;
+  - the probe's allowlist excluding the sender: nothing reaches the core.
+Result: 347633 checks, 0 failed, normal and -DBR_SANITIZE=ON trees.
+
+Former core defect, fixed: a lost first MODE frame used to stall the
+probe's ARQ window; SPEC-NOTES N46 ("DATA floor") removed it and
+test_scen_mode_loss.c covers it. The ACK-blind run still arms loss only once
+STREAMING, like the UART test, so that handshake loss stays out of what the
+run measures.
+
+
+8. SPEC-NOTES candidates (C.5 left these undefined; decisions taken here)
+-------------------------------------------------------------------------
+
+ N46  C.5 "idx:7 | LAST:1": LAST is bit 7 of byte 2, idx bits 6..0.
+ N47  C.5 "ceil(n / 29) packets" is 0 for n = 0: an empty frame goes as one
+      LAST segment with no payload (3 bytes). The adapter never sends one
+      (send() refuses len 0, BR_ERR_ARG, like uart_link).
+ N48  Duplicates: a repeat of the last accepted segment (same src, tag,
+      idx), or of a completed frame's segments, is ignored and counted
+      (dups); every other idx mismatch drops the open frame (gaps). C.5
+      says only "segments in order; a gap ... drops the frame".
+ N49  Segments with idx > 0 and no open frame are counted per segment as
+      orphans, not as frame drops (a frame whose segment 0 was lost has no
+      other record); seg_fail-style totals are frames_dropped + orphans
+      of segment 1, which the adapter cannot tell apart.
+ N50  Buffer-full policy: a segment 0 from a new src when every buffer is
+      open is dropped (buffer_full); open buffers are reclaimed only by the
+      50 ms timeout, idle (closed) ones by LRU. C.5 names 4 buffers but no
+      policy.
+ N51  Address byte order: C.5 lists "50 4C U_hi U_lo A5"; the chip takes
+      address registers LSByte first. The listed order is the on-air order
+      (index 0 = most significant, sent first after the preamble); the
+      driver writes the bytes reversed (A5 U_lo U_hi 4C 50). All nodes must
+      agree or nobody hears anybody; an RF24-library peer would call
+      openWritingPipe(0x504C0101A5ULL) for unit 0x0101.
+ N52  EN_AA stays set on the broadcast pipe (datasheet: dynamic payloads on
+      a pipe require ENAA_Px); floods are unacknowledged through the
+      per-packet NO_ACK flag (W_TX_PAYLOAD_NO_ACK), which C.5 already
+      names. "NO_ACK broadcast pipe" means that, not EN_AA cleared.
+ N53  Segment src byte vs header prev_hop: the hint address is derived from
+      the header prev_hop (bytes 6..7), not from the src byte; a mismatch
+      is counted (rx_src_mismatch) and the frame is still delivered (the
+      CRC / hop_tag decide).
+ N54  seg_fail (br_stats_t, Appendix B) cannot be incremented by an
+      adapter: no core hook. Proposed br_node_count_seg_fail(); until then
+      the adapter's frames_dropped / orphans are the bench counters.
+ N55  Half-duplex collision avoidance beyond C.5's NRF_GUARD_MS 2: a 1 ms
+      post-RX hold before starting a transmit (open frame or just
+      completed), see 5. Not in the spec; it removed the systematic MAX_RT
+      pair after a lost ACK on a LAST segment in the host model.
+ N56  C.5 "MAX_RT after the retries is the 11.6 failover signal": applied
+      per frame (the frame is abandoned at the first MAX_RT segment,
+      remaining segments are not sent); a frame that was fully received
+      but whose last ACK was lost is reported undelivered while the peer
+      has it whole (the node's dedup handles the retransmission).
+ N57  12.4 "radio busy" hook: nrf24_link_radio_busy() = transmitting or
+      within the 1 ms post-RX hold. ESP-NOW has no mid-reception signal;
+      cross-radio arbitration is implemented in RADIO-ARB.txt (N62-N64)
+      on what each radio can observe.
+ N58  C.5 "NRF_REASM 4 buffers of 258 bytes": the buffers are 250 bytes
+      (= max_frame); a frame that would exceed 250 is dropped as oversize
+      when the segment arrives, so 258 is never needed (9 x 29 = 261 would
+      be the natural capacity, 250 is the protocol limit).
+
+
+9. What cannot be verified without modules
+------------------------------------------
+
+- That the chip answers at all on these pins (MISO wiring, 3.3 V, the
+  presence check in hal_nrf24_init), SPI mode 0 timing at 8 MHz with the
+  ESP-IDF polling driver, the CS behaviour (CSN high between commands).
+- The address byte order decision N51: the host fake only checks that the
+  driver reverses the bytes; whether two real modules hear each other with
+  it is a two-module test. An RF24-library sketch on any Arduino with
+  openReadingPipe(1, 0x504CFFFFA5ULL) on channel 76, 2 Mbps, DPL on, 2-byte
+  CRC should receive our floods.
+- ACTIVATE on clones (SI24R1 and friends need it, have different RF_SETUP
+  power bits, and some lack dynamic payloads).
+- Real ESB timing: ARD 500 us (C.5) is comfortably above the 250 us the
+  datasheet allows for a 32-byte payload without ACK payload at 2 Mbps;
+  whether 7.5 ms of retries covers a 9-segment frame plus the 2 ms guard
+  with the real pump cadence (polling at 2 ms: about 9 x 2 = 18 ms per
+  frame, so the IRQ pin matters there).
+- RX FIFO depth 3 vs pump cadence: whether a 2 ms poll ever lets the FIFO
+  fill (then the chip stops acknowledging and the sender retries, visible
+  as acks_lost at the sender and dups at nobody).
+- The 12.4 coexistence numbers (crc_fail / reassembly drops with the
+  ESP-NOW radio idle vs loaded on one board), and the antenna separation.
+- Current draw and brown-out with and without the 10 uF.
+- The node_app wiring of 6 on real hardware: BRNRF init line, pump cadence
+  with the real SPI timing, the IRQ path (ISR -> kEvtNrfIrq -> pump), the
+  `nrf=on` boot with no module attached (expected: "BRNRF no module
+  answering ...", board runs on its other transports).
+
+Compile verification done instead (no hardware):
+- host: cmake -S firmware/host -B firmware/host/build && cmake --build ...
+  && ctest -R nrf24: PASS; same with -DBR_SANITIZE=ON (build-asan): PASS.
+- target: pio run -e esp32_dev (after rm -rf .pio/build/esp32_dev) and
+  -e esp32s3_dev build components/app_nrf24_link with -Wall -Wextra
+  -Wpedantic -Werror -Wconversion -Wsign-conversion; port_spi.cpp and
+  port_nrf24.cpp compiled by hand per chip with the port_espnow.cpp command
+  line from compile_commands.json plus the esp_driver_spi include dirs,
+  because port_esp_idf/CMakeLists.txt is not mine to edit (see 6.1).
+
+10. Other carriers
+------------------
+
+The same image carries four transports, each enabled per board from the
+console and registered in this order (each present one takes the next
+transport index; BRSTART lists them as transports=espnow+uart+udp+nrf24):
+
+    espnow   on by default (`espnow=off` only on a LAN-side UDP board, 12.4)
+    uart     `uart=on`   UART-LINK.txt   RAW, COBS + RS(8), point to point
+    udp      `udp=on`    UDP-LINK.txt    PACKET, WiFi station + lwIP UDP, LAN side
+    nrf24    `nrf=on`    NRF24-LINK.txt  PACKET, nRF24L01+ with segmentation
+
+Policy (node_console.c, host test test_console_links.c): udp=on requires
+espnow=off (a station follows the AP's channel); at least one transport
+must be on; the bench allowlist `nbr=` applies to every transport by unit
+ID. Expected log lines common to all carriers: BRBOOT started ... uart=yes|no
+udp=yes|no nrf=yes|no, BRSTART ... transports=..., BRLINK neighbour 0x....
+via=uart2|udp a.b.c.d:port|nrf24 50:4c:.. and the per-carrier BRSTAT fields
+(uart_* / udp_* / nrf_*) with drop names u_* / ud_* / n_*, present only
+when that link is on. FLASH-DEMO.md section 5 has the ESP-NOW-only lines.

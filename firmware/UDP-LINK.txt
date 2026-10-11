@@ -1,0 +1,271 @@
+Braid WiFi UDP link (PACKET carrier) - LAN-side notes
+==========================================================
+
+What it is: a transport adapter that carries Braid frames in UDP
+datagrams over an ordinary WiFi / Ethernet LAN. Spec 1.2 "WiFi UDP" row,
+11.11, 12.4, Appendix C.4; SPEC-NOTES N22 (bench allowlist) applies. Files:
+
+    components/app_hal/include/hal_udp.h          5-call socket HAL (open, sendto,
+                                                  recvfrom, mcast join/leave, close)
+                                                  + hal_udp_wifi_sta_start()
+    components/port_esp_idf/port_udp.cpp          ESP-IDF port (lwIP BSD sockets, esp_wifi STA)
+    host/udp_posix.c                              POSIX port, near-identical to port_udp.cpp
+    components/app_udp_link/include/udp_link.h    the adapter (portable C11, HAL-free)
+    components/app_udp_link/src/udp_link.c
+    components/app_udp_link/src/udp_link_hal.c    binds the adapter's ops table to hal_udp.h
+    test/host/test_udp_link.c                     host test (fake socket + real loopback sockets)
+
+NOT YET RUN ON HARDWARE. Wired into node_app, the console and the build
+(section 3 records what was done and where it deviates from the plan).
+Built on both targets; host-tested with real UDP sockets on 127.0.0.1 (two
+nodes direct, three nodes through a relay).
+
+
+1. Where it may run: LAN side only (spec 12.4, USER-DECIDED)
+-------------------------------------------------------------
+
+A UDP node is a WiFi station associated with an access point (or a wired
+LAN chip). Association moves the WiFi channel to the AP's channel, so ESP-NOW
+and UDP can NEVER run on one chip: the mesh would lose its fixed channel.
+
+    udp=on  and  espnow=on  on the same board  ->  the console MUST refuse it.
+
+The gateway is two chips (12.4): the mesh chip runs ESP-NOW (and UART / nRF24),
+the LAN chip runs UDP. Both bring-up helpers own the WiFi driver; whichever
+runs second gets HAL_ERR_BUSY (hal_radio_init vs hal_udp_wifi_sta_start).
+
+Transport facts (udp_link_fill_transport): PACKET, max_frame 250, rs_nsym 0,
+can_broadcast true, mac_retry false, edge_only false, link_cost 1, addr_len 6.
+
+Addressing (C.4): every node binds UDP port 40888. Floods go to multicast
+239.255.40.88:40888 with IP TTL 1 (IGMP join at start); unicast goes to the
+ip:port the core learnt for next_hop. Static IPs or DHCP reservations. Where
+multicast or client isolation blocks it (`mcast=off`), a configured unicast
+peer list replaces multicast: a flood becomes one unicast datagram per peer.
+
+Deviations / decisions to fold into SPEC-NOTES (candidates for v0.9):
+
+  U1  addr_len 6, not 4: the carrier address is IPv4 || UDP port (network
+      order). Several nodes may share one IP (host tests: all on 127.0.0.1;
+      a laptop running two nodes) and a relay must tell them apart. On a
+      real LAN with every node on 40888 the last two bytes are constant.
+  U2  The adapter keeps no address table. The sender's ip:port is handed to
+      br_node_rx() as the prev_hop hint and the core learns
+      (prev_hop, link) -> ip:port at step 6, AFTER the hop_tag check, so a
+      spoofed prev_hop cannot redirect unicast (an adapter table filled
+      before authentication could). send() receives that address back.
+  U3  When the core has no link entry for next_hop it calls send() with
+      addr NULL even for a unicast frame (br_node.c node_unicast,
+      addr_len 0). The adapter floods it (multicast / peer list) and counts
+      `unknown_next_hop`.
+  U4  mac_retry false (spec 1.2 lists it only for ESP-NOW and nRF24). UDP has
+      no acknowledgement; like UART (N44) every datagram the socket accepted
+      is reported delivered = true through udp_link_report_tx_status()
+      (never from inside send()), which the core ignores for mac_retry
+      false. 11.6 link deletion never fires on UDP; a dead peer is found by
+      ARQ / N37, keepalive, session timeout and table expiry.
+  U5  IP_MULTICAST_LOOP is a configuration flag (udp_link_cfg_t.mcast_loop):
+      off on a device (the core drops its own echo anyway, 11.4 step 9a),
+      on for host tests that run several nodes in one process.
+  U6  No RSSI on a LAN: hint rssi = BR_RSSI_UNKNOWN, link_cost 1.
+
+
+2. Running the host tests
+-------------------------
+
+    cmake -S firmware/host -B firmware/host/build
+    cmake --build firmware/host/build
+    (cd firmware/host/build && ctest -R udp --output-on-failure)
+
+    ASan + UBSan tree:
+    cmake -S firmware/host -B firmware/host/build-asan -DBR_SANITIZE=ON
+    cmake --build firmware/host/build-asan && (cd firmware/host/build-asan && ctest -R udp)
+
+test_udp_link runs in about 2 s of wall time (real CLOCK_MONOTONIC, real
+sockets) and prints one line per topology:
+
+    B: sender <-> probe direct    t= 0.20s hops=1 presses 5/5 acked 10 retx 0 | dgrams A tx=14 rx=15 ...
+    C: sender -> relay -> probe   t= 0.26s hops=2 presses 5/5 acked 10 retx 0 | dgrams A tx=14 ... B tx=29 ...
+    multicast on loopback: works (group 239.255.40.88)
+
+Part A  adapter against a fake socket table (floods: multicast vs peer list,
+        unicast to a learnt address, unknown next_hop, send errors, oversize,
+        allowlist N22, receive errors, tx-status reporting).
+Part B  two real nodes (sender 0x0101, probe 0x0103 in group 0xFF10) on
+        127.0.0.1, each with its own udp_link on its own port, peer lists
+        (no multicast), Appendix A bench key, AUTH on, fec_m 0, ARQ on:
+        seek, bind, 5 presses delivered with hops == 1 and acknowledged; the
+        sender's link table holds the probe's 127.0.0.1:port with addr_len 6.
+Part C  three nodes with relay 0x0102: peer lists A = {B}, B = {A, C},
+        C = {B} and matching allowlists; presses delivered with hops == 2,
+        the route at A is {next_hop 0x0102, hops 2}, A never learns C.
+Part D  multicast on loopback: join / leave, a datagram between two members
+        of 239.255.40.88 on one port, and a flood between two adapters.
+        Skipped (TU_SKIP, not a failure) where the host has no multicast on
+        127.0.0.1 or no default route.
+
+Former core defect, fixed: a lost FIRST MODE frame used to stall the
+session (the probe's ARQ window waited for the lost seq). SPEC-NOTES N46
+("DATA floor") removed it; test_scen_mode_loss.c covers it. Nothing is lost
+on loopback anyway, so this test never depended on it.
+
+
+3. Integration (node_app / console / build) - DONE, with these deviations
+-------------------------------------------------------------------------
+
+Status (integration pass, 2026-10-08): everything below is implemented.
+Deviations from the plan as written:
+
+  - Transport slots: BR_NODE_MAX_TRANSPORTS=4 image-wide (platformio.ini
+    build_flags for every env, firmware/host/CMakeLists.txt PUBLIC on the
+    braid target). Transport indices are assigned in registration order
+    (espnow, uart, udp, nrf24; absent links skipped), so "link=1" is no
+    longer a constant anywhere.
+  - Receive pump: option 2 ("udprx" task, core 0, prio tskIDLE_PRIORITY + 6,
+    3072 B, hal_udp_recvfrom timeout 1000 ms, one datagram per kEvtUdpRx
+    event with ip:port packed in Evt.addr). The task receives into a
+    256-byte staging buffer and drops datagrams > 250 itself (ud_oversize),
+    so a truncated oversize datagram can never look like a valid frame.
+  - New console key espnow=on|off (default on). udp=on with espnow=on is
+    refused; so is espnow=off with no other transport on; udp=on needs
+    ssid=; mcast=off needs peers=. pass= is 8..63 characters (WPA2) or
+    empty (open AP); peers= entries must be unicast host addresses (0.0.0.0,
+    127/8, 224/4, 255.255.255.255 refused). The parser never echoes pass=,
+    not even a refused one, and no error text of a line that mentions "pass"
+    quotes any token (a passphrase typed with a space or without "=" stays
+    out of the log); br show prints pass=set|unset. The udprx task takes at
+    most half of the 16 RX queue slots, so a LAN flood (pre-authentication,
+    any host can send) cannot starve the other carriers' RX events.
+  - WiFi start, socket open and the udprx task happen in start_role()
+    (before the "br" task exists; events wait in the queue like UART
+    chunks). HAL_ERR_TIMEOUT: the socket is opened anyway. Any other WiFi
+    error, an adapter init refusal, an open failure or a refused multicast
+    join without peers: the board runs without the UDP link and the
+    console stays up (no reboot, the STA helper is not retry-safe).
+  - BRSTAT drop names use the prefix ud_ (ud_oversize ud_refused ud_partial
+    ud_badlen ud_unknown ud_rxerr ud_qdrop), not u_: the UART link already
+    owns u_oversize / u_qdrop and a gateway LAN chip may run both. The UDP
+    allowlist drops are summed into the common "allowlist" name.
+  - BRUDP log line has no link= field (see slots above); BRWIFI line adds
+    ssid=. Expected lines, still not observed on hardware:
+        BRRADIO espnow off (LAN-side board, 12.4)
+        BRWIFI sta up ip=192.168.1.20 ssid=lab
+        BRUDP port=40888 mcast=239.255.40.88 ttl=1 peers=0 PACKET max_frame=250 cost=1
+        BRSTART node 0x0103 ... transports=udp
+        BRBOOT started role=probe ... uart=no udp=yes nrf=no
+        BRLINK neighbour 0x0101 via=udp 192.168.1.10:40888 (lan, cost 1)
+        BRSTAT ... udp_tx=.. udp_rx=.. hwm=.. heap=.. drops=none
+
+The original plan follows, kept for the rationale.
+
+
+3.1 Build
+
+    components/port_esp_idf/CMakeLists.txt:
+        SRCS          add "port_udp.cpp"
+        PRIV_REQUIRES add lwip
+    (port_udp.cpp was compiled with the port component's exact flags for a
+    syntax check only; it is not in the image until this is merged.)
+
+    A NEW component directory is only seen after `rm -rf .pio/build/<env>`:
+    an incremental `pio run` does not re-run CMake (README-BUILD says this
+    for app_braid sources; it holds for new components too).
+
+    Bench boards that may carry espnow + uart + udp + nrf24 need four
+    transport slots: platformio.ini build_flags (or the per-component
+    options) -DBR_NODE_MAX_TRANSPORTS=4 for app_braid, app_node and
+    every host test that includes br_node.h (br_node_init() refuses a
+    sizeof(br_node_t) mismatch between translation units, so the flag must
+    be global for the image). Default stays 2.
+
+3.2 Console keys (`br set`, saved in NVS, applied at boot; `br reboot`)
+
+    udp=on|off            default off. REJECT udp=on while espnow=on (12.4):
+                          "udp and espnow cannot share a chip". node_app
+                          must then skip hal_radio_init() and call
+                          hal_udp_wifi_sta_start() instead.
+    port=<n>              local UDP port, default 40888 (C.4)
+    mcast=on|off          default on: floods to 239.255.40.88:<port>, TTL 1;
+                          off: floods to the peers= list (required then)
+    peers=ip[:port],...   up to UDP_LINK_MAX_PEERS (8) unicast peers;
+                          udp_link_parse_peer() accepts "a.b.c.d" (port
+                          40888) and "a.b.c.d:port". NVS blob br/udp_peers.
+    ssid=<text>           1..32 bytes, AP to associate with (NVS br/ssid)
+    pass=<text>           0..63 bytes, WPA2-PSK; empty = open AP (NVS br/pass).
+                          Plaintext in NVS until the production overlay
+                          enables NVS encryption; never echo it in `br show`.
+    `br show` prints " udp=on port=40888 mcast=on peers=..." / "ssid=<ssid>"
+    only when udp=on.
+
+3.3 node_app wiring (components/app_node/src/node_app.cpp)
+
+    a. After hal_kv_init(): if udp=on, hal_udp_wifi_sta_start(ssid, pass,
+       15000, &ip) and log "BRWIFI sta ip=a.b.c.d"; on HAL_ERR_TIMEOUT keep
+       going (the driver retries; floods fail until the link is up). The
+       helper is not retry-safe after a partial failure (a second
+       esp_netif_create_default_wifi_sta() asserts): on any other error
+       log BRWIFI and reboot instead of calling it again.
+    b. Before br_node_init(): udp_link_cfg_t from the console fields,
+       udp_link_register(&nc, &g_udp, &ucfg, &kLinkUdp); copy the nbr=
+       allowlist into nc.transports[kLinkUdp].allowlist (unit IDs, N22:
+       the same list applies to every transport); udp_link_open(&g_udp)
+       (BR_ERR_NOT_IMPLEMENTED = join refused: log and fall back to
+       mcast=off if a peer list exists, else BRUDP error).
+    c. Receive pump, two options (udp_link_pump() never spawns a thread):
+       Option 1 (simplest): in br_task's loop replace the queue wait with a
+         short wait and call udp_link_pump(&g_udp, &g_node, kLinkUdp,
+         &g_node.cfg.transports[kLinkUdp], 1 /* ms */, 16) once per loop
+         before br_node_tick(). The task then wakes on UDP traffic too; the
+         1 ms select bounds the latency added to queue events.
+       Option 2 (keeps br_task's queue wait): a small task "udprx" pinned to
+         core 0 (with the WiFi / lwIP tasks), priority tskIDLE_PRIORITY + 6,
+         3072 B stack, that loops on hal_udp_recvfrom(timeout 1000 ms) and
+         posts each datagram plus ip:port as a kEvtUdpRx Evt into g_q with
+         timeout 0 (count a drop like g_rx_qdrop). br_task then calls
+         udp_link_deliver(&g_udp, &g_node, kLinkUdp, tr, e.data, e.len, ip,
+         port, nullptr) for that event. The Evt needs 4 + 2 bytes for
+         ip:port (reuse Evt.addr[0..5]).
+       Either way call udp_link_report_tx_status(&g_udp, &g_node, kLinkUdp)
+       after br_node_tick() (no-op in the core, keeps the counters honest).
+    d. BRLINK log for a UDP neighbour: addr_len 6 -> print
+       udp_link_format_peer(ip, port) ("via=udp 192.168.1.20:40888").
+    e. BRSTAT: udp_tx / udp_rx (tx_datagrams / rx_datagrams), drops
+       u_oversize, u_refused, u_unknown (unknown_next_hop), u_alist.
+    f. Expected log lines (targets, not yet observed):
+         BRWIFI sta up ip=192.168.1.20
+         BRUDP port=40888 mcast=239.255.40.88 ttl=1 link=1 PACKET max_frame=250
+         BRSTART node 0x0103 ... transports=udp
+         BRLINK neighbour 0x0101 via=udp 192.168.1.10:40888 (lan, cost 1)
+
+3.4 Later: the "laptop node"
+
+    br_node + udp_link + host/udp_posix.c already run on a PC (that is what
+    test_udp_link.c does). A small host executable (firmware/host/
+    plnode_main.c, linked against braid like br_selftest) that reads
+    role / id / grp / peers from argv, installs the CLOCK_MONOTONIC
+    platform, opens one udp_link and loops pump -> tick -> report would be
+    a probe or sender on the LAN without any board: a bench sink for the
+    gateway's LAN chip, a traffic generator, or a protocol trace tap
+    (print every br_rx_verdict_t). Multicast works on a normal LAN
+    interface; on Linux loopback it worked in the test as well.
+
+4. Other carriers
+-----------------
+
+The same image carries four transports, each enabled per board from the
+console and registered in this order (each present one takes the next
+transport index; BRSTART lists them as transports=espnow+uart+udp+nrf24):
+
+    espnow   on by default (`espnow=off` only on a LAN-side UDP board, 12.4)
+    uart     `uart=on`   UART-LINK.txt   RAW, COBS + RS(8), point to point
+    udp      `udp=on`    UDP-LINK.txt    PACKET, WiFi station + lwIP UDP, LAN side
+    nrf24    `nrf=on`    NRF24-LINK.txt  PACKET, nRF24L01+ with segmentation
+
+Policy (node_console.c, host test test_console_links.c): udp=on requires
+espnow=off (a station follows the AP's channel); at least one transport
+must be on; the bench allowlist `nbr=` applies to every transport by unit
+ID. Expected log lines common to all carriers: BRBOOT started ... uart=yes|no
+udp=yes|no nrf=yes|no, BRSTART ... transports=..., BRLINK neighbour 0x....
+via=uart2|udp a.b.c.d:port|nrf24 50:4c:.. and the per-carrier BRSTAT fields
+(uart_* / udp_* / nrf_*) with drop names u_* / ud_* / n_*, present only
+when that link is on. FLASH-DEMO.md section 5 has the ESP-NOW-only lines.

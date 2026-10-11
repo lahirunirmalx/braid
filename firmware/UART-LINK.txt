@@ -1,0 +1,154 @@
+Braid UART link (RAW carrier) - bench notes
+================================================
+
+What it is: a second transport next to ESP-NOW. Spec 1.2 UART row, 3.2,
+11.3, C.2, C.6; SPEC-NOTES N42 to N45. Point to point, 8N1, COBS framing
+with 0x00 delimiter, RS(8) per hop, max_frame 250 (path MTU 242 through a
+UART hop). Same firmware image; enabled per board with `br set uart=on`.
+
+NOT YET RUN ON HARDWARE: everything below is built and host-tested only
+(firmware/test/host/test_uart_link.c drives two real nodes through two
+adapters and a byte pipe). Treat the expected lines as the target.
+
+
+1. Wiring (two boards)
+----------------------
+
+    board A TX  ----->  board B RX
+    board A RX  <-----  board B TX
+    board A GND ------  board B GND      (always, even on one USB hub)
+
+Default pins (spec C.6, IO_MUX pins of the controller used):
+
+    ESP32 (WROOM-32/32E)   UART2   TX GPIO17   RX GPIO16
+    ESP32-S3 (WROOM-1)     UART1   TX GPIO17   RX GPIO18
+
+Mixed pair, ESP32 A + ESP32-S3 B: A GPIO17 -> B GPIO18, B GPIO17 -> A GPIO16.
+
+- 3.3 V logic on both sides. Never a 5 V TTL adapter.
+- 921600 baud: keep the wires under about 1 m, twisted with GND if you
+  can. Flying leads, longer runs or a breadboard: `ubaud=115200` on BOTH
+  boards (the rate is not negotiated).
+- ESP32-WROVER modules: GPIO16/17 are the PSRAM. Use e.g. `utx=25 urx=26`.
+- The console refuses flash, PSRAM, USB, console (UART0) and strapping
+  pins for utx/urx (ESP32 GPIO0/2/5/12/15, S3 GPIO0/3/45/46): the peer
+  holds our RX high through reset, and GPIO12 high bricks the boot.
+- The RX pin gets the internal pull-up, so an unplugged cable idles high.
+
+
+2. Console (115200 on the USB port, as before)
+----------------------------------------------
+
+New keys (`br set`, saved in NVS, applied at boot, `br reboot` after a
+change while running):
+
+    uart=on|off        default off
+    utx=<gpio>         default 17
+    urx=<gpio>         default 16 (ESP32) / 18 (ESP32-S3)
+    ubaud=<n>          default 921600; 9600 19200 38400 57600 115200 230400
+                       460800 921600 1000000 1500000 2000000
+
+`br show` prints ` uart=on utx=17 urx=16 ubaud=921600` at the end of the
+BRCFG line only when the link is on. The `nbr=` allowlist applies to BOTH
+transports, by unit ID: a UART peer is identified by the prev_hop in its
+frames (there is no MAC on a wire).
+
+Two boards over the wire only (different Wi-Fi channels, so ESP-NOW
+cannot join them):
+
+    A:  br set role=sender id=0x0101 grp=0xFF10 chan=1 uart=on
+    B:  br set role=probe  id=0x0103 grp=0xFF10 chan=6 uart=on
+    both: br reboot
+
+
+3. Expected log lines
+---------------------
+
+At boot, each board (ESP32 shown; S3 says uart1 ... rx=GPIO18):
+
+    BRRADIO espnow chan=1 mac=..
+    BRUART uart2 tx=GPIO17 rx=GPIO16 baud=921600 RAW max_frame=250 rs_nsym=8 path_mtu=242
+    BRSTART node 0x0101 txseq=.. preseq=.. allowlist=off (all neighbours) transports=espnow+uart
+    BRBOOT started role=sender ... uart=yes udp=no nrf=no
+
+(The transport index of the UART link is no longer fixed at 1: links are
+numbered in registration order, espnow, uart, udp, nrf24, skipping absent
+ones. BRSTART's transports= field is the authoritative list.)
+
+When the first frame from the peer arrives:
+
+    BRLINK neighbour 0x0103 via=uart2 (wire, no mac, cost 1)
+
+Sender then: BRSEEK ... hops=1, BRSTATE sender ... -> STREAMING, BRREADY.
+Press BOOT on A: A logs BRACK, B logs BRRX src=0x0101 hops=1 ... and
+BREDGE, LED flashes 5 times.
+
+BRSTAT (every 5 s, or `br stats`) gains three fields when the link is on:
+
+    BRSTAT role=sender uid=0x0101 sess=STREAMING relay_fwd=0 delivered=2 retx=0
+           auth_fail=0 tx=.. rx=.. routes=1 uart_tx=.. uart_rx=.. rs_fixed=0
+           hwm=.. heap=.. drops=none
+
+    uart_tx / uart_rx   frames written to / decoded from the wire
+    rs_fixed            frames the RS(8) parity repaired (line noise)
+
+UART-related drop names (shown only when non-zero):
+
+    u_cobs      delimited block that was not valid COBS (noise hit a code byte)
+    u_oversize  more than 251 bytes without a 0x00 (lost delimiter)
+    u_resync    times the receiver threw bytes away up to the next 0x00
+    u_lost      byte loss reported by the driver / queue (FIFO or ring overflow)
+    u_qdrop     received chunks dropped because the event queue was full
+    u_txfull    frames not sent: UART TX ring full (never blocks)
+    u_framing   8N1 framing errors (wrong ubaud on one side, noise)
+    u_break     line breaks (peer reset, cable pulled)
+    rs_fail     frames RS could not repair (dropped; ARQ resends DATA)
+
+A steady u_framing count means the two boards disagree on ubaud.
+A wire has no delivery ACK: 11.6 link deletion never fires on UART; a
+pulled cable shows up as retx / gaps and finally BRCLOSED and a re-SEEK.
+
+
+4. Mixed demo: A -> B over UART, B -> C over ESP-NOW
+----------------------------------------------------
+
+    A (sender)  ==UART==  B (relay)  ~~ESP-NOW~~  C (probe)
+
+    A:  br set role=sender id=0x0101 grp=0xFF10 chan=6 uart=on
+    B:  br set role=node   id=0x0102 chan=1 uart=on
+    C:  br set role=probe  id=0x0103 grp=0xFF10 chan=1
+    all: br reboot
+
+A sits alone on channel 6, so its only path is the wire; B and C share
+channel 1. No allowlist is needed with three boards (if more boards are on
+channel 1, give B nbr=0x0101,0x0103 and C nbr=0x0102: the list applies to
+both of B's transports).
+
+Expected:
+- B: BRLINK neighbour 0x0101 via=uart2 ..., BRLINK neighbour 0x0103 mac=..
+- A's SEEK leaves with path_mtu 242; B re-floods it on ESP-NOW only (never
+  back over the wire, 11.11); C answers, the session runs at 242 bytes.
+- C on each press: BRRX src=0x0101 hops=2 ... and the LED flashes.
+- B's BRSTAT relay_fwd grows; B strips the RS parity coming off the wire
+  and sends plain frames on ESP-NOW (RS is per hop, RAW links only).
+
+5. Other carriers
+-----------------
+
+The same image carries four transports, each enabled per board from the
+console and registered in this order (each present one takes the next
+transport index; BRSTART lists them as transports=espnow+uart+udp+nrf24):
+
+    espnow   on by default (`espnow=off` only on a LAN-side UDP board, 12.4)
+    uart     `uart=on`   UART-LINK.txt   RAW, COBS + RS(8), point to point
+    udp      `udp=on`    UDP-LINK.txt    PACKET, WiFi station + lwIP UDP, LAN side
+    nrf24    `nrf=on`    NRF24-LINK.txt  PACKET, nRF24L01+ with segmentation
+
+Policy (node_console.c, host test test_console_links.c): udp=on requires
+espnow=off (a station follows the AP's channel); at least one transport
+must be on; the bench allowlist `nbr=` applies to every transport by unit
+ID. Expected log lines common to all carriers: BRBOOT started ... uart=yes|no
+udp=yes|no nrf=yes|no, BRSTART ... transports=..., BRLINK neighbour 0x....
+via=uart2|udp a.b.c.d:port|nrf24 50:4c:.. and the per-carrier BRSTAT fields
+(uart_* / udp_* / nrf_*) with drop names u_* / ud_* / n_*, present only
+when that link is on. FLASH-DEMO.md section 5 has the ESP-NOW-only lines.

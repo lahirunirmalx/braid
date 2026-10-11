@@ -1,0 +1,251 @@
+Braid 12.4 bridge radio arbitration (nRF24 + ESP-NOW on one board)
+=======================================================================
+
+Spec: PROTOCOL.md v0.8 12.4 ("a bridge never starts a transmission on one
+radio while the other is mid-reception of a multi-segment frame"), C.5
+(nRF24 half duplex, guard, segmentation), 11.11 (carrier notes).
+SPEC-NOTES: N60 (nRF24 collision avoidance, nrf24_link_radio_busy()), N62-N64
+(this rule as implemented). NRF24-LINK.txt section 6 item 7 is this work.
+
+NOT YET RUN ON HARDWARE: no board is connected and no nRF24 module exists
+yet. Verified by the host test (firmware/test/host/test_radio_arb.c) and
+by the two device builds. Every timing below is a target.
+
+
+1. What is observable (fidelity)
+--------------------------------
+
+| Direction                              | Signal used                                         | Fidelity |
+|----------------------------------------|-----------------------------------------------------|----------|
+| Hold ESP-NOW TX while nRF24 busy       | nrf24_link_radio_busy(): own nRF24 TX in progress,  | good     |
+|                                        | or < 1 ms since the last received segment (N60)     |          |
+| Hold nRF24 TX while ESP-NOW active     | hal_radio_tx_inflight() > 0: an ESP-NOW frame of    | TX only  |
+|                                        | ours between esp_now_send() and its send callback   |          |
+|                                        | (unicast and broadcast). ESP-NOW RX is invisible to |          |
+|                                        | the application: an nRF24 start can land on an      |          |
+|                                        | ESP-NOW frame being received (at most one frame     |          |
+|                                        | time, ~0.5-2.3 ms at 1 Mbps; single packet, so no   |          |
+|                                        | "multi-segment" reception exists on that side)      |          |
+| Hold nRF24 TX while WiFi STA active    | nothing: lwIP sends and receives happen inside the  | none     |
+|  (gateway LAN side, udp=on)            | closed WiFi driver. NOT arbitrated. The 12.4        |          |
+|                                        | frequency plan (mesh / AP channel vs nRF ch 76-81,  |          |
+|                                        | antenna separation) is the only protection there    |          |
+
+The nRF24 "busy" signal is only as fresh as the pump: a segment that is on
+the air but not yet drained from the RX FIFO is not seen (polling at 2 ms,
+or at once with the IRQ pin wired, nirq=).
+
+
+2. Rule as implemented
+----------------------
+
+- Two directions, one rule. Before an ESP-NOW start, ask the nRF24 signal;
+  before an nRF24 frame start, ask the ESP-NOW signal. Busy -> hold the
+  frame (it stays queued, nothing is refused or dropped). hold_* counts
+  once per held frame.
+- Bounded hold: cap 20 ms (RADIO_ARB_CAP_US_DEFAULT; a 9-segment nRF24
+  frame at 2 ms polling is about 18 ms busy). When one hold reaches the cap
+  the start goes ahead (arb_to += 1) and that busy signal is treated as
+  STALE: later starts in that direction go at once, each counted in arb_to,
+  until the signal is read idle once. Deliberately not expired by time:
+  with expiry, a wedged signal under sparse traffic paid a fresh 20 ms hold
+  per burst (host test: 20 holds instead of 1); without it, a stale state
+  can outlive a quiet period and let one start through that a fresh hold
+  would have held, which is counted in arb_to. So a wedged signal (an ESP-NOW send
+  callback that never runs) costs one cap, not one cap per frame, and
+  arb_to = the number of starts made while the other radio read busy.
+  A failed ESP-NOW unicast to a dead peer can take longer than 20 ms of MAC
+  retries before its callback; the cap fires then. Accepted (counted).
+- Only frame STARTS are gated. An nRF24 frame already being sent is never
+  paused between its segments (it is one transmission); ESP-NOW frames
+  already handed to the driver are not recalled.
+- Every decision is taken in the protocol task "br": both TX starts happen
+  there already (the core's send() calls and the nRF24 pump), so the
+  arbiter state needs no lock. The only cross-task value is the port's
+  std::atomic in-flight counter, read from "br".
+- Single-radio boards (espnow only, nrf only, or espnow off on a LAN-side
+  board): the arbiter has one query, both directions return "go" at once,
+  nothing is queued or counted. Zero added latency (host-tested).
+- Cost on a bridge: an nRF24 -> ESP-NOW forward waits for the 1 ms
+  post-RX hold of N60 (the frame arrives, the core forwards it inside the
+  pump, the nRF24 radio still reads busy), i.e. about +1 ms per forwarded
+  frame, plus up to one pump tick (1 ms, CONFIG_FREERTOS_HZ 1000).
+
+
+3. Deviation from the original design (and why)
+-----------------------------------------------
+
+The plan was to set an "ESP-NOW TX in flight" flag in the wrapper and clear
+it when br_task processes the existing kEvtTxStatus queue event. That event
+exists only for UNICAST: port_espnow.cpp send_cb returns early for
+broadcasts (no verdict), so every SEEK / flood copy would have pinned the
+flag until the 20 ms cap; and a dropped kEvtTxStatus (g_txst_qdrop) would
+pin it too. The ESP-NOW driver runs the send callback for EVERY frame
+esp_now_send() accepted, broadcast included, so the port now counts frames
+between esp_now_send() and that callback:
+
+    hal_radio.h      uint32_t hal_radio_tx_inflight(void);      (new, additive)
+    port_espnow.cpp  std::atomic<uint32_t> g_tx_inflight: +1 BEFORE
+                     esp_now_send (the Wi-Fi task on core 0 can run the
+                     callback before the call returns), -1 if the send is
+                     refused, -1 at the top of send_cb for every frame,
+                     never below 0. The unicast verdict path is unchanged.
+
+The decision still happens in br_task (it reads the counter); the callback
+touches only the port's own atomic. Port behaviour is otherwise unchanged,
+so a build whose node_app.cpp does not call anything below still works
+exactly as before.
+
+
+4. Files
+--------
+
+    components/app_node/src/radio_arb.[ch]      arbiter: two busy queries, hold, cap, stale rule, counters (portable C11)
+    components/app_node/src/espnow_link.[ch]    ESP-NOW TX deferral: 4-frame static FIFO + pump around the raw send (portable C11)
+    components/app_node/src/radio_arb_hal.[ch]  device glue: radio_arb_setup_board() wires hal_radio_tx_inflight()
+                                                and nrf24_link_radio_busy(), installs the nRF24 transmit gate
+    components/app_nrf24_link/src/nrf24_link.[ch]  pump hook: nrf24_link_set_tx_gate(), asked right before a frame starts
+    components/app_hal/include/hal_radio.h      hal_radio_tx_inflight()
+    components/port_esp_idf/port_espnow.cpp     the in-flight counter
+    components/app_node/CMakeLists.txt          the three new .c files (SRCS + the strict portable flag set)
+    firmware/test/host/test_radio_arb.c         host test (section 7)
+
+espnow_link: send() = br_transport_t.send of the "espnow" transport. Queue
+empty and nRF24 idle -> raw send at once (result returned unchanged).
+Otherwise the frame is copied into the FIFO and BR_OK is returned (a held
+BIND / HELLO / SEEK is delayed, never refused; refusing it would cost a
+retry round, ARQ covers only DATA). FIFO full -> BR_ERR_QUEUE_FULL, the code
+tr_send already returns for HAL_ERR_BUSY. espnow_link_pump() drains in
+order while allowed; a queued frame the raw send then refuses is dropped
+(arb_derr) and tr_send still counts it in send_refused.
+
+
+5. Integration lines for node_app.cpp (gateway agent applies these)
+-------------------------------------------------------------------
+
+Nothing else in node_app.cpp changes; handle_event() kEvtTxStatus stays as
+it is (the counter does not need it).
+
+(a) includes, next to #include "nrf24_link_hal.h":
+
+    #include "espnow_link.h"
+    #include "radio_arb.h"
+    #include "radio_arb_hal.h"
+
+(b) globals, next to `nrf24_link_t g_nlink;` / `g_nrf_deadline`:
+
+    radio_arb_t g_arb;                        // 12.4 bridge arbitration (RADIO-ARB.txt)
+    espnow_link_t g_elink;                    // ESP-NOW TX deferral around tr_send
+    uint64_t g_esp_deadline = BR_NEVER_US;    // when the ESP-NOW deferral pump wants to run again
+
+(c) node_init_from(), "espnow" transport block: replace
+
+        tr.send = tr_send;
+        tr.user = nullptr;
+
+    with
+
+        (void)espnow_link_init(&g_elink, tr_send, nullptr, &g_arb);  // g_arb is set up below
+        tr.send = espnow_link_send;
+        tr.user = &g_elink;
+
+(d) node_init_from(), right after the `if (g_nrf_on) { ... nrf24_link_register ... }`
+    block and before the static_assert / br_node_init():
+
+        // 12.4: hold one radio's TX start while the other is busy (no-op unless both are on).
+        (void)radio_arb_setup_board(&g_arb, g_espnow_on, g_nrf_on ? &g_nlink : nullptr);
+
+    (If nrf24_link_start() later fails and g_nrf_on goes false, nothing
+    else is needed: nrf24_link_radio_busy() reads false on a link that is
+    not started.)
+
+(e) br_task() loop, wake computation, after the g_nrf_deadline line:
+
+        if (g_espnow_on && g_esp_deadline < wake) wake = g_esp_deadline;  // held ESP-NOW frames (12.4)
+
+(f) br_task() loop, after EACH of the two in-loop nrf24_link_pump() calls
+    (right after the `if (g_nrf_on) { ... log_new_links(); }` block that
+    follows the event drain - NOT inside it - and right after the
+    `if (g_nrf_on) g_nrf_deadline = nrf24_link_pump(...)` line that follows
+    br_node_tick()); the TODO(radio-arb) comment at the first one can go:
+
+        if (g_espnow_on) g_esp_deadline = espnow_link_pump(&g_elink, hal_sys_time_us());
+
+    Order: nRF24 pump first, then the ESP-NOW pump (either order is safe).
+
+(g) print_stats(), BRSTAT, inside `if (g_nrf_on && g_espnow_on)` (bridge
+    only; the fields are all 0 elsewhere):
+
+        radio_arb_stats_t as = {};
+        espnow_link_stats_t es = {};
+        radio_arb_get_stats(&g_arb, &as);
+        espnow_link_get_stats(&g_elink, &es);
+        node_fmt_str(&f, " arb_hold_e=");  node_fmt_u32(&f, as.hold_espnow);
+        node_fmt_str(&f, " arb_hold_n=");  node_fmt_u32(&f, as.hold_nrf);
+        node_fmt_str(&f, " arb_to=");      node_fmt_u32(&f, as.timeout);
+        node_fmt_str(&f, " arb_defer=");   node_fmt_u32(&f, es.deferred);
+        node_fmt_str(&f, " arb_qfull=");   node_fmt_u32(&f, es.qfull);
+        node_fmt_str(&f, " arb_derr=");    node_fmt_u32(&f, es.drain_err);
+
+    The BRSTAT buffer (static char buf[1100]) gains at most ~90 bytes.
+
+
+6. BRSTAT fields (bridge boards)
+--------------------------------
+
+    arb_hold_e   ESP-NOW frames held because the nRF24 radio was busy (radio_arb_stats_t.hold_espnow)
+    arb_hold_n   nRF24 frames held because ESP-NOW TX was in flight      (radio_arb_stats_t.hold_nrf)
+    arb_to       starts made while the other radio read busy (cap / stale signal; radio_arb_stats_t.timeout)
+    arb_defer    ESP-NOW frames queued instead of sent at once           (espnow_link_stats_t.deferred)
+    arb_qfull    ESP-NOW frames refused, deferral FIFO full              (espnow_link_stats_t.qfull)
+    arb_derr     queued ESP-NOW frames the radio refused at drain time   (espnow_link_stats_t.drain_err)
+
+Expected on a healthy bridge: arb_hold_e close to the number of nRF24 ->
+ESP-NOW forwards, arb_hold_n small, arb_to 0, arb_qfull 0, arb_derr 0.
+arb_to > 0 means a busy signal outlived 20 ms (check the ESP-NOW peer, or
+continuous nRF24 traffic); it is the number of overlapping starts.
+Commissioning (12.4): compare crc_fail / seg_fail / rx_frames at the bridge
+with the co-located radio idle and loaded, as before.
+
+
+7. Host test (firmware/test/host/test_radio_arb.c)
+--------------------------------------------------
+
+Part A radio_arb: hold / release, counted once per held frame, the cap and
+the stale rule, custom cap, independent directions, single-radio and
+never-initialised arbiters are no-ops (query never even called).
+Part B espnow_link: pass-through without arbiter and with a single-radio
+arbiter (the raw send runs inside send(), same clock tick), enqueue while
+held, drain order with unicast / broadcast addresses, order kept when the
+radio frees up, FIFO full, drain refusal, bad lengths, cap on a held FIFO.
+Part C nRF24 gate on a lone adapter: held while ESP-NOW is in flight (the
+held frame does not make the nRF24 side read busy), starts on release,
+never gated between segments, starts after the cap; single-radio arbiter
+starts on the same pump pass as no gate.
+Part D end to end: sender A (nRF24 only) -> bridge B (nRF24 + ESP-NOW,
+relay) -> probe C (ESP-NOW only), three real br_node instances, a fake ESB
+medium A <-> B and a fake ESP-NOW medium B <-> C whose in-flight count has
+the hal_radio_tx_inflight() semantics. Instruments at B: each ESP-NOW start
+checked against nrf24_link_radio_busy(), each nRF24 frame start (segment 0)
+against the ESP-NOW in-flight count. Runs: clean and 3 seeds with 5 % nRF24
+packet/ACK loss (every press delivered, hops 2, 0 overlaps, arb_to 0,
+arb_hold_e 42, arb_hold_n 1); a wedged ESP-NOW signal (one send callback
+never runs: one 20 ms hold, then arb_to = overlapping nRF24 starts = 45,
+delivery unaffected); and a control run with the arbitration off (42
+ESP-NOW and 21 nRF24 overlapping starts: the instrument does see overlaps
+when nothing prevents them).
+
+    cmake -S firmware/host -B firmware/host/build && cmake --build firmware/host/build
+    ctest --test-dir firmware/host/build -R test_radio_arb --output-on-failure
+
+
+8. Open (hardware)
+------------------
+
+- Whether hal_radio_tx_inflight() returns to 0 promptly after every send on
+  IDF 5.5.3 (it should: the callback runs per accepted frame); arb_to > 0
+  with no nRF24 traffic would say otherwise.
+- The real cost of the +1 ms forward delay on the section 9 frame rate at a
+  bridge (about 60 frames/s through the gateway is the budget).
+- crc_fail / seg_fail at the bridge with arbitration on vs off (the
+  commissioning test of 12.4), once two nRF24 modules exist.

@@ -1,0 +1,61 @@
+Braid on-chip self-test (phase 1a gate)
+
+What it does
+  Replays the Appendix A vectors the phase 1a modules cover (CRC, COBS,
+  RS incl. error + erasure correction, group FEC with erasures, frame
+  encode + validate, HKDF key schedule, HMAC, AES-CCM encrypt / decrypt /
+  tamper reject, hop_tag, test-key blacklist) on the chip, using the
+  hardware AES / SHA through mbedtls. Same code as the host ctest target
+  br_selftest (firmware/host). The selftest envs run ONLY the selftest task
+  (no protocol stubs). Nothing is written to flash besides the app image.
+
+1. Build, flash and monitor (run from firmware/)
+     ESP32    (ESP32-WROOM-32E devkit):
+       pio run -e esp32_selftest -t upload -t monitor
+     ESP32-S3 (ESP32-S3-DevKitC-1, N8):
+       pio run -e esp32s3_selftest -t upload -t monitor
+   Several boards plugged in: add --upload-port /dev/ttyUSB0 (and
+   --monitor-port /dev/ttyUSB0), or the /dev/ttyACM0 name you see in
+   `pio device list`.
+   ESP32-S3: use the port marked UART (USB-to-UART bridge). The native USB
+   port also shows the log (secondary console).
+   Leave the monitor with Ctrl+C. Press the board's RST/EN button to rerun.
+
+2. Save the log to a file instead (optional)
+     pio device monitor -b 115200 | tee selftest_esp32.log
+   then press RST on the board, wait 15 s, Ctrl+C.
+
+3. What PASS looks like (numbers are illustrative; check count is fixed)
+     I (...) app: selftest task up on core1, stack 8192 bytes
+     I (...) app: selftest warm-up: 826 checks, 0 failed, heap delta 0 (one-time lazy init)
+     I (...) br_selftest: group crc         53 checks   0 failed      123 us
+     ...                   (10 group lines: crc cobs rs fec frame hkdf hmac ccm hop_tag blacklist)
+     I (...) app: selftest: 826 checks, 0 failed, rc=0, total ... us
+     I (...) app: selftest stack: ... of 8192 bytes used (high-water mark ... free)
+     I (...) app: selftest heap: free before=... after=... delta=0
+     I (...) app: selftest heap: lowest during run=..., peak transient use=... bytes ...
+     I (...) app: BR_SELFTEST RESULT: PASS 826/826
+   The result line repeats every 10 s. Quick check:
+     grep "BR_SELFTEST RESULT" selftest_esp32.log
+   PASS needs: every check passed AND free heap identical before / after
+   the measured run (zero net heap use).
+
+4. If it FAILS (or crashes, or no RESULT line within 15 s after reset)
+   Send back, per board:
+     - the board / module name (ESP32 or ESP32-S3, devkit model);
+     - the full serial log from the first "rst:" line to the first
+       "BR_SELFTEST RESULT" line (or to the crash backtrace), as a file;
+     - every line containing "FAIL [" (group, br_selftest.c line number and
+       the failing expression), "selftest heap", "selftest stack";
+     - for a crash / reboot loop: the "Guru Meditation" block and the
+       decoded backtrace that the monitor prints (esp32_exception_decoder
+       filter is on in platformio.ini);
+     - the output of: pio run -e esp32_selftest -v 2>&1 | tail -40
+       only if the build itself failed.
+   Do not retry with other settings first; the log of the first run is the
+   most useful.
+
+5. Host equivalent (no hardware)
+     cmake -S firmware/host -B firmware/host/build
+     cmake --build firmware/host/build
+     ctest --test-dir firmware/host/build -R br_selftest --output-on-failure
