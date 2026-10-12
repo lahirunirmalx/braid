@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/braid-logo-dark.svg">
+    <img alt="Braid - one mesh, many carriers" src="docs/assets/braid-logo-light.svg" width="560">
+  </picture>
+</p>
+
 # Braid
 
 A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART, WiFi UDP and nRF24L01+, with integrity, error recovery and encryption built in.
