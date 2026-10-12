@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 lahiru
+#
+# Braid CI: host test suites (normal + ASan/UBSan), generated-file checks,
+# and firmware builds for ESP32 / ESP32-S3. Runs on every push and PR.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ESP-IDF 5.5.3 as pinned by platformio.ini (espressif32@6.13.0). The host
+  # build takes mbedtls from this package so host and device crypto match.
+  ESPIDF_PKG: platformio/framework-espidf@3.50503.0
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  host-tests:
+    name: Host tests (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [normal, sanitize]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-espidf-${{ env.ESPIDF_PKG }}-v1
+
+      - name: Install PlatformIO and the ESP-IDF package (for mbedtls)
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+          pio pkg install -g -t "$ESPIDF_PKG"
+          ls "$HOME/.platformio/packages/framework-espidf/components/mbedtls/mbedtls/CMakeLists.txt"
+
+      - name: Configure
+        run: |
+          SAN=OFF
+          if [ "${{ matrix.variant }}" = "sanitize" ]; then SAN=ON; fi
+          cmake -S firmware/host -B firmware/host/build -DBR_SANITIZE=$SAN
+
+      - name: Build (warnings are errors)
+        run: cmake --build firmware/host/build -j"$(nproc)"
+
+      - name: Run test suites
+        run: ctest --test-dir firmware/host/build --output-on-failure --timeout 900
+
+  generated-files:
+    name: Vectors, generated files, ASCII
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python deps
+        run: pip install reedsolo cryptography
+
+      - name: Test vectors (spec Appendix A oracle)
+        run: python tools/vectors.py | tee vectors.log && tail -1 vectors.log | grep -qx 'ALL OK'
+
+      - name: vectors_generated.h matches the oracle
+        run: |
+          python tools/vectors.py --emit-c firmware/test/host/vectors_generated.h > /dev/null
+          git diff --exit-code -- firmware/test/host/vectors_generated.h
+
+      - name: Logo SVGs match the generator
+        run: |
+          mkdir -p /tmp/logo
+          python tools/gen_logo.py /tmp/logo > /dev/null
+          for f in docs/assets/*.svg; do cmp "$f" "/tmp/logo/$(basename "$f")"; done
+
+      - name: ASCII-only text files
+        run: |
+          # LICENSE-DOCS is the verbatim CC BY-SA 4.0 legal code.
+          if grep -rIlP '[^\x00-\x7F]' --exclude=LICENSE-DOCS --exclude-dir=.git . ; then
+            echo "::error::non-ASCII characters found in the files listed above"
+            exit 1
+          fi
+
+  firmware:
+    name: Firmware (${{ matrix.env }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [esp32_dev, esp32s3_dev, esp32_selftest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-fw-${{ matrix.env }}-${{ hashFiles('firmware/platformio.ini') }}-v1
+          restore-keys: |
+            pio-fw-${{ matrix.env }}-
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Build
+        run: pio run -d firmware -e ${{ matrix.env }} 2>&1 | tee build.log
+
+      - name: No compiler warnings
+        run: |
+          if grep -n 'warning:' build.log; then
+            echo "::error::compiler warnings in ${{ matrix.env }}"
+            exit 1
+          fi

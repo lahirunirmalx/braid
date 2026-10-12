@@ -5,6 +5,11 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/lahirunirmalx/braid/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/lahirunirmalx/braid/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue"></a>
+</p>
+
 # Braid
 
 A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART, WiFi UDP and nRF24L01+, with integrity, error recovery and encryption built in.
