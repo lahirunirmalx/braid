@@ -576,8 +576,10 @@ struct DispSnap {
     uint8_t  last_val;
     int8_t   rssi;                        // probe: last-hop RSSI of the last sample, 0 = none
     uint8_t  n_nb;
-    uint16_t nb[kDispNb];                 // live neighbours (link table, unexpired)
-    int8_t   nb_rssi[kDispNb];            // their RSSI EWMA, BR_RSSI_UNKNOWN on wired carriers
+    uint16_t nb[kDispNb];                 // neighbours heard in the last kNbForgetMs, most recent first
+    int8_t   nb_rssi[kDispNb];            // their last RSSI EWMA, BR_RSSI_UNKNOWN on wired carriers
+    uint16_t nb_age[kDispNb];             // seconds since last heard (minute steps past 60 s)
+    uint8_t  n_live;                      // of those, heard within the link TTL (60 s)
     uint32_t presses;
     uint32_t delivered;
     uint32_t tx;
@@ -588,6 +590,19 @@ struct DispSnap {
     char     state[12];
     char     event[OLED_COLS + 1];
 };
+// Neighbour memory for the screen ("br" only): the core drops a link 60 s
+// (BR_LINK_TTL_MS) after its last frame and nodes send no beacons, so an
+// idle relay would show nobody. The screen keeps each neighbour 10 min with
+// its last RSSI and age, greyed out once the core has let it go.
+constexpr uint32_t kNbForgetMs = 600000;
+constexpr size_t kNbMem = 8;
+struct NbMem {
+    uint16_t unit;                        // 0 = free
+    int8_t   rssi;
+    uint32_t last_ms;                     // br_ms clock of the last frame heard
+};
+NbMem g_nb_mem[kNbMem] = {};
+
 DispSnap g_disp_br;                       // owned by "br"
 DispSnap g_disp_pub;                      // under g_disp_lock
 StaticSemaphore_t g_disp_lock_buf;
@@ -1560,26 +1575,60 @@ void disp_publish() {
     d.hops = 0;
     d.via = 0;
     d.n_nb = 0;
+    d.n_live = 0;
     std::memset(d.nb, 0, sizeof d.nb);
     std::memset(d.nb_rssi, 0, sizeof d.nb_rssi);
+    std::memset(d.nb_age, 0, sizeof d.nb_age);
+    const uint32_t now_ms = br_ms_from_us(hal_sys_time_us());
     const br_tables_t *t = nullptr;
     if (br_node_get_tables(&g_node, &t) == BR_OK && t != nullptr) {
-        const uint32_t now_ms = br_ms_from_us(hal_sys_time_us());
         for (const auto &r : t->route.e) {
             if (d.peer != 0 && r.dst_id == d.peer && br_ms_before(now_ms, r.expiry_ms)) {
                 d.hops = r.hops;
                 d.via = r.next_hop;
             }
         }
+        // Live links refresh the memory (last frame = expiry - TTL).
         for (const auto &e : t->link.e) {
             if (e.transport == BR_NO_TRANSPORT || e.unit_id == 0 || !br_ms_before(now_ms, e.expiry_ms)) continue;
-            bool dup = false;
-            for (uint8_t i = 0; i < d.n_nb; i++) dup = dup || d.nb[i] == e.unit_id;
-            if (!dup && d.n_nb < kDispNb) {
-                d.nb_rssi[d.n_nb] = e.rssi_ewma;
-                d.nb[d.n_nb++] = e.unit_id;
+            const uint32_t heard = e.expiry_ms - BR_LINK_TTL_MS;
+            NbMem *slot = nullptr;
+            NbMem *oldest = &g_nb_mem[0];
+            for (auto &m : g_nb_mem) {
+                if (m.unit == e.unit_id) slot = &m;
+                if (m.unit == 0 || (oldest->unit != 0 && br_ms_before(m.last_ms, oldest->last_ms))) oldest = &m;
+            }
+            if (slot == nullptr) {
+                slot = oldest;  // free slot, else the longest silent one
+                slot->unit = e.unit_id;
+                slot->last_ms = heard;
+            }
+            if (!br_ms_before(heard, slot->last_ms)) {
+                slot->last_ms = heard;
+                slot->rssi = e.rssi_ewma;
             }
         }
+    }
+    // Forget after kNbForgetMs; publish the kDispNb most recent.
+    for (auto &m : g_nb_mem) {
+        if (m.unit != 0 && now_ms - m.last_ms > kNbForgetMs) m.unit = 0;
+    }
+    bool taken[kNbMem] = {};
+    while (d.n_nb < kDispNb) {
+        size_t best = kNbMem;
+        for (size_t i = 0; i < kNbMem; i++) {
+            if (g_nb_mem[i].unit == 0 || taken[i]) continue;
+            if (best == kNbMem || br_ms_before(g_nb_mem[best].last_ms, g_nb_mem[i].last_ms)) best = i;
+        }
+        if (best == kNbMem) break;
+        taken[best] = true;
+        const uint32_t age_s = (now_ms - g_nb_mem[best].last_ms) / 1000u;
+        d.nb[d.n_nb] = g_nb_mem[best].unit;
+        d.nb_rssi[d.n_nb] = g_nb_mem[best].rssi;
+        // seconds below a minute, then whole minutes: the screen redraws only when the text changes
+        d.nb_age[d.n_nb] = static_cast<uint16_t>(std::min<uint32_t>(age_s < 60 ? age_s : age_s / 60 * 60, 0xFFFFu));
+        if (age_s * 1000u < BR_LINK_TTL_MS) d.n_live++;
+        d.n_nb++;
     }
     if (xSemaphoreTake(g_disp_lock, 0) != pdTRUE) return;  // "disp" is copying: next pass
     const bool changed = std::memcmp(&g_disp_pub, &d, sizeof d) != 0;
@@ -1762,8 +1811,8 @@ const char *disp_role_name(uint8_t role) {
 //   1  STREAMING                    forwarding
 //   2  HOP 2     peer 0103          12        forwarded
 //   3            via  0102                    frames
-//   4  press 3 ack 6                0101 -71dBm      (neighbours with RSSI,
-//   5  tx 12 rx 13 fwd 0            0103 -80dBm       then counters)
+//   4  press 3 ack 6                0101 -71dBm 4s   (neighbours: RSSI, age;
+//   5  tx 12 rx 13 fwd 0            0103 -80dBm 3m    grey once silent 60 s)
 //   6  nb 0102 0103                 tx 12 rx 13 fwd 12
 //   7  LED x5 from 0x0101           last event
 struct DispRow {
@@ -1806,10 +1855,12 @@ void disp_build(const DispSnap &s, DispView &v) {
     std::memset(&v, 0, sizeof v);
     row_set(v.row[0], DISP_C_TITLE, "%s 0x%04X", disp_role_name(g_run.role), g_run.uid);
     if (g_run.role == NODE_ROLE_NODE) {
-        if (s.n_nb == 0) {
-            row_set(v.row[1], DISP_C_WARN, "no neighbours");
-        } else {
+        if (s.n_live > 0) {
             row_set(v.row[1], DISP_C_GOOD, "forwarding");
+        } else if (s.n_nb > 0) {
+            row_set(v.row[1], DISP_C_WARN, "idle (no traffic)");
+        } else {
+            row_set(v.row[1], DISP_C_WARN, "no neighbours");
         }
         (void)std::snprintf(v.big, sizeof v.big, "%" PRIu32, s.fwd > 99999u ? 99999u : s.fwd);
         v.big_color = DISP_C_ACCENT;
@@ -1817,10 +1868,19 @@ void disp_build(const DispSnap &s, DispView &v) {
         row_set(v.row[3], DISP_C_DIM, "frames");
         unsigned r = 4;
         for (uint8_t i = 0; i < s.n_nb && r < 7; i++, r++) {
-            if (s.nb_rssi[i] == BR_RSSI_UNKNOWN) {
-                row_set(v.row[r], DISP_C_FG, "%04X  wired", s.nb[i]);
+            // live: coloured by signal; older than the link TTL: grey, last values
+            const bool live = static_cast<uint32_t>(s.nb_age[i]) * 1000u < BR_LINK_TTL_MS;
+            char age[8];
+            if (s.nb_age[i] < 60) {
+                (void)std::snprintf(age, sizeof age, "%us", s.nb_age[i]);
             } else {
-                row_set(v.row[r], disp_theme_rssi(s.nb_rssi[i]), "%04X  %ddBm", s.nb[i], s.nb_rssi[i]);
+                (void)std::snprintf(age, sizeof age, "%um", s.nb_age[i] / 60u);
+            }
+            if (s.nb_rssi[i] == BR_RSSI_UNKNOWN) {
+                row_set(v.row[r], live ? DISP_C_FG : DISP_C_DIM, "%04X wired %s", s.nb[i], age);
+            } else {
+                row_set(v.row[r], live ? disp_theme_rssi(s.nb_rssi[i]) : DISP_C_DIM, "%04X %ddBm %s", s.nb[i],
+                        s.nb_rssi[i], age);
             }
         }
         if (s.n_nb == 0) row_set(v.row[r++], DISP_C_WARN, "nb none");
@@ -1857,7 +1917,7 @@ void disp_build(const DispSnap &s, DispView &v) {
     for (uint8_t i = 0; i < s.n_nb && n > 0 && static_cast<size_t>(n) < sizeof nb; i++) {
         n += std::snprintf(nb + n, sizeof nb - static_cast<size_t>(n), " %04X", s.nb[i]);
     }
-    row_set(v.row[6], s.n_nb == 0 ? DISP_C_WARN : DISP_C_FG, "%s", nb);
+    row_set(v.row[6], s.n_nb == 0 ? DISP_C_WARN : (s.n_live > 0 ? DISP_C_FG : DISP_C_DIM), "%s", nb);
     row_set(v.row[7], DISP_C_DIM, "%s", s.event);
 }
 

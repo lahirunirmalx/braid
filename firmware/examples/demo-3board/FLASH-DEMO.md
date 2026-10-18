@@ -263,12 +263,13 @@ chip's native one (`/dev/ttyACM0`); the console reads commands there too.
    neighbour and the mesh picks the path. With lists, every board must list
    the new id.
 
-Screen (relay): `RELAY 0x0104`, `forwarding` / `no neighbours`, the number
-of frames forwarded in large digits, then one row per neighbour with its
-RSSI, coloured by signal: green >= -75 dBm, orange >= -85 dBm, red below
-(colours come from `components/app_node/src/disp_theme.c`). A relay learns
-neighbours only from frames it hears: while A and C stream directly to each
-other it may show `no neighbours` until A's next SEEK (reset A to see it).
+Screen (relay): `RELAY 0x0104`, `forwarding` / `idle (no traffic)` /
+`no neighbours`, the number of frames forwarded in large digits, then one
+row per neighbour with its RSSI and how long ago it was heard
+(`0101 -71dBm 4s`), coloured by signal: green >= -75 dBm, orange >= -85 dBm,
+red below (colours come from `components/app_node/src/disp_theme.c`). A
+relay learns neighbours only from frames it hears; a neighbour silent for
+60 s turns grey with its last RSSI and age, and is dropped after 10 min.
 Sender and probe screens match the OLED layout, in colour.
 
 Stuck in `waiting for download` (ROM bootloader) after a reset storm: unplug
@@ -288,9 +289,10 @@ the longer chain (`HOP 2 via ...`, then `HOP 3` on A's screen). The last hop
 into C stayed at -82 to -84 dBm, so the Cardputer sat near the edge of C's
 range; place the relay next to the fixed board where it sees -75 or better.
 
-A relay lists only neighbours heard in the last 60 s (link TTL; there are no
-beacons), so an idle relay shows `no neighbours` while still in range. Reset
-A (a fresh SEEK) to see the list fill again.
+The core keeps a link only 60 s after its last frame (link TTL; there are no
+beacons), so a relay that carries no traffic hears nobody. The screen
+therefore keeps each neighbour 10 min, greyed out with its age once silent;
+reset A (a fresh SEEK) to refresh the list.
 
 ## 7. Troubleshooting
 
