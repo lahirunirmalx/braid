@@ -19,7 +19,7 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 > - Protocol specification: **v0.9 (draft)**. Wire version 1, minor 0.
 > - Firmware is **host-verified**: 25 test suites (including about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios and RFC 3610 CCM vectors).
 > - Builds for **ESP32** and **ESP32-S3** with ESP-IDF 5.5.3.
-> - **First hardware run (ESP32 only, 2026-10-18):** the on-chip self-test passes (826/826, zero heap delta) and the 3-board ESP-NOW demo works (button on A, relayed by B, LED on C, `hops=2`, `auth_fail=0`). With the allowlists opened, A and C also bind directly (`hops=1`). Optional SSD1306 status displays ran on A and C. Not yet run on ESP32-S3.
+> - **First hardware run (ESP32 only, 2026-10-18):** the on-chip self-test passes (826/826, zero heap delta) and the 3-board ESP-NOW demo works (button on A, relayed by B, LED on C, `hops=2`, `auth_fail=0`). With the allowlists opened, A and C bind directly (`hops=1`), keep working with B unplugged, and fall back to the path through B when out of each other's range. Optional SSD1306 status displays ran on A and C. Not yet run on ESP32-S3.
 > - UART, WiFi UDP and nRF24 carriers have **not been run on hardware**. The **nRF24 register driver has never touched a chip.**
 > - Do not deploy this yet. Treat it as a reviewable design plus a tested core.
 

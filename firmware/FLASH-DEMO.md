@@ -208,7 +208,8 @@ other they bind directly and B carries nothing:
 BRRX src=0x0101 hops=1 seq=.. value=1        <- on C
 ```
 B is used only when A and C are out of each other's range (different rooms):
-then C shows `hops=2` again. If the active path dies, A's session closes and
+then C shows `hops=2` again. Both cases (B unplugged, and the fallback through
+B out of range) were checked on hardware on 2026-10-18. If the active path dies, A's session closes and
 re-SEEKs (backoff 1 s up to 30 s) over whichever path still works.
 
 Unplug B and press BOOT on A: with A and C in range the LED still flashes,
