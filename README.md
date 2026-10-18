@@ -17,9 +17,9 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 > ## Status
 >
 > - Protocol specification: **v0.9 (draft)**. Wire version 1, minor 0.
-> - Firmware is **host-verified**: 25 test suites (including about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios and RFC 3610 CCM vectors).
+> - Stack and demo are **host-verified**: 26 test suites (about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios, RFC 3610 CCM vectors).
 > - Builds for **ESP32** and **ESP32-S3** with ESP-IDF 5.5.3.
-> - **First hardware run (ESP32 only, 2026-10-18):** the on-chip self-test passes (826/826, zero heap delta) and the 3-board ESP-NOW demo works (button on A, relayed by B, LED on C, `hops=2`, `auth_fail=0`). With the allowlists opened, A and C bind directly (`hops=1`), keep working with B unplugged, and fall back to the path through B when out of each other's range. Optional SSD1306 status displays ran on A and C. Not yet run on ESP32-S3.
+> - **Run on hardware (ESP32 only, 2026-10-18):** on-chip self-test PASS 826/826; 3-board ESP-NOW demo works over 2 hops, directly between A and C, and falls back to the relay when out of range. Not yet run on ESP32-S3.
 > - UART, WiFi UDP and nRF24 carriers have **not been run on hardware**. The **nRF24 register driver has never touched a chip.**
 > - Do not deploy this yet. Treat it as a reviewable design plus a tested core.
 
@@ -35,11 +35,13 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 
 | Carrier | Role | Status |
 |---|---|---|
-| ESP-NOW | Primary mesh radio | Implemented, host-verified, 3-board demo run on ESP32 |
+| ESP-NOW | Primary mesh radio | Implemented, host-verified, run on ESP32 (demo, range test) |
 | UART | Wired point-to-point, RAW framing (COBS) | Implemented, host-verified, not run on hardware |
 | WiFi UDP | LAN carrier, gateway side | Implemented, host-verified, not run on hardware |
 | nRF24L01+ | Second mesh radio / bridge | Implemented; register driver never touched a chip |
 | IR | Edge link (leaf devices) | Specified only |
+
+The ESP-NOW and UART link adapters and the radio arbitration currently live in the demo example (`app_node`); the UDP and nRF24 carriers are stack components.
 
 ## Use cases
 
@@ -49,38 +51,40 @@ Details in PROTOCOL.md section 13.
 - Campsite perimeter monitoring: battery sensors (PIR, beam-break, tripwire, reed) watched from a base.
 - Vehicle and flight-data links: sensors to an onboard recorder over UART or direct ESP-NOW. The recorder must store data locally (the protocol is transport, not storage). Not certified aviation.
 
+## Stack and examples
+
+- **Stack** (`firmware/components`): protocol core, HAL, ESP-IDF port and the UDP / nRF24 carriers. `firmware/` itself builds only the on-chip self-test image.
+- **Examples** (`firmware/examples/`): applications built on the stack, each a PlatformIO project of its own that pulls the stack from `../../components`.
+
+| Example | What it shows |
+|---|---|
+| [demo-3board](firmware/examples/demo-3board/README.md) | Button on board A to LED on board C over ESP-NOW, relayed by B; serial console config, optional SSD1306 status display, range-test logger |
+
 ## Quick start
 
 Prerequisites: [PlatformIO](https://platformio.org/) (platform `espressif32@6.13.0`, which brings ESP-IDF 5.5.3), CMake 3.16 or newer, a C compiler for the host build. Python 3 with `reedsolo` and `cryptography` is needed only to regenerate test vectors.
 
-Host tests (from the repo root):
+1. Host tests (from the repo root; add `-DBR_SANITIZE=ON` in a separate build dir for ASan/UBSan):
 
-```
-cmake -S firmware/host -B firmware/host/build
-cmake --build firmware/host/build
-ctest --test-dir firmware/host/build
-```
+   ```
+   cmake -S firmware/host -B firmware/host/build
+   cmake --build firmware/host/build
+   ctest --test-dir firmware/host/build
+   ```
 
-Sanitizers: add `-DBR_SANITIZE=ON` and use a separate build dir, for example `firmware/host/build-asan`.
+2. On-chip self-test (from `firmware/`; see [SELFTEST.txt](firmware/SELFTEST.txt)). Prints `BR_SELFTEST RESULT: PASS n/n`:
 
-Device build (from `firmware/`):
+   ```
+   pio run -e esp32_selftest -t upload -t monitor
+   ```
 
-```
-pio run -e esp32_dev        # ESP32-WROOM-32E
-pio run -e esp32s3_dev      # ESP32-S3-WROOM-1
-```
+3. 3-board demo (from `firmware/examples/demo-3board/`; flash and configure with [FLASH-DEMO.md](firmware/examples/demo-3board/FLASH-DEMO.md)):
 
-On-chip self-test (replays the Appendix A vectors on the chip, see `firmware/SELFTEST.txt`):
+   ```
+   pio run -e esp32_dev -t upload --upload-port /dev/ttyUSB0
+   ```
 
-```
-pio run -e esp32_selftest -t upload -t monitor
-```
-
-It prints `BR_SELFTEST RESULT: PASS n/n` on success.
-
-3-board demo (button on board A, relay B, LED on board C): see [firmware/FLASH-DEMO.md](firmware/FLASH-DEMO.md). An SSD1306 128x64 I2C display on GPIO21 (SDA) / GPIO22 (SCL) is picked up automatically and shows the session, hop count and route.
-
-Builds here are development builds only: no Secure Boot, flash encryption or anti-rollback.
+All builds are development builds: no Secure Boot, flash encryption or anti-rollback.
 
 ## Repository layout
 
@@ -92,15 +96,15 @@ NOTICE                 test-key warning
 roast/                 design review history (field and security reviews, rounds 1-4)
 tools/vectors.py       oracle that generates and checks all test vectors
 firmware/
-  components/
+  components/          the stack
     app_braid/         protocol core: CRC, COBS, RS, FEC, ARQ, crypto, sessions, mesh
-    app_hal/           HAL headers (GPIO, UART, SPI, UDP, radio, KV, time)
+    app_hal/           HAL headers (GPIO, UART, SPI, I2C, UDP, radio, KV, time)
     port_esp_idf/      HAL implementation on ESP-IDF
-    app_node/          node app, console, ESP-NOW and UART links, radio arbitration,
-                       optional SSD1306 status display (I2C, autodetected)
     app_udp_link/      WiFi UDP carrier
     app_nrf24_link/    nRF24L01+ carrier and register driver
-  main/                app_main
+  main/                on-chip self-test image
+  examples/
+    demo-3board/       3-board demo (own platformio.ini, components/app_node, tools/)
   host/                host CMake build and CTest hook
   sim/                 host mesh simulator (virtual medium and clock)
   test/host/           unit, fuzz and scenario tests, generated vectors
@@ -108,14 +112,20 @@ firmware/
 
 ## Documentation
 
+Stack:
+
 - [PROTOCOL.md](PROTOCOL.md): full specification.
 - [SPEC-NOTES.md](SPEC-NOTES.md): implementation decisions and spec errata.
-- [firmware/README-BUILD.txt](firmware/README-BUILD.txt): toolchain, build, host tests.
-- [firmware/FLASH-DEMO.md](firmware/FLASH-DEMO.md): 3-board demo.
+- [firmware/README-BUILD.txt](firmware/README-BUILD.txt): toolchain, builds, host tests.
 - [firmware/SELFTEST.txt](firmware/SELFTEST.txt): on-chip self-test.
 - [firmware/UART-LINK.txt](firmware/UART-LINK.txt), [UDP-LINK.txt](firmware/UDP-LINK.txt), [NRF24-LINK.txt](firmware/NRF24-LINK.txt): carrier notes.
 - [firmware/GATEWAY-NRF24.txt](firmware/GATEWAY-NRF24.txt), [RADIO-ARB.txt](firmware/RADIO-ARB.txt): single-chip gateway and radio arbitration.
 - [roast/](roast/): design review history.
+
+Examples:
+
+- [firmware/examples/demo-3board/README.md](firmware/examples/demo-3board/README.md): what the demo contains and how to build it.
+- [firmware/examples/demo-3board/FLASH-DEMO.md](firmware/examples/demo-3board/FLASH-DEMO.md): flash sheet, expected output, direct and relayed variants, range test, troubleshooting.
 
 ## Licence
 

@@ -151,4 +151,4 @@ ID. Expected log lines common to all carriers: BRBOOT started ... uart=yes|no
 udp=yes|no nrf=yes|no, BRSTART ... transports=..., BRLINK neighbour 0x....
 via=uart2|udp a.b.c.d:port|nrf24 50:4c:.. and the per-carrier BRSTAT fields
 (uart_* / udp_* / nrf_*) with drop names u_* / ud_* / n_*, present only
-when that link is on. FLASH-DEMO.md section 5 has the ESP-NOW-only lines.
+when that link is on. examples/demo-3board/FLASH-DEMO.md section 5 has the ESP-NOW-only lines.

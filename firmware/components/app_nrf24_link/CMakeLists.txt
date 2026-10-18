@@ -10,8 +10,9 @@
 # Everything except nrf24_link_hal.c is portable C11 with no ESP-IDF,
 # FreeRTOS or HAL header and is host-tested by
 # firmware/test/host/test_nrf24_link.c (which includes the .c files directly).
-# Wired into node_app (nrf=on, firmware/NRF24-LINK.txt section 6); app_node
-# REQUIRES this component and port_esp_idf PRIV_REQUIRES it (nrf24_regs.h).
+# Used by applications that REQUIRE this component, e.g. the demo's app_node
+# (examples/demo-3board, nrf=on, firmware/NRF24-LINK.txt section 6);
+# port_esp_idf PRIV_REQUIRES it (nrf24_regs.h).
 idf_component_register(
     SRCS
         "src/nrf24_seg.c"

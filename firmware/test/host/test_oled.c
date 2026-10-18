@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_oled.c - host test of the status display driver
- * (components/app_node/src/oled.c), compiled into this executable.
+ * (examples/demo-3board/components/app_node/src/oled.c), compiled into this executable.
  *
  * Part A  font: glyph table bounds, blank for non-printable bytes, a few
  *         glyphs pinned byte for byte (0, 1, A, x).
@@ -23,7 +23,7 @@
 #include "braid/br_types.h"
 #include "test_util.h"
 
-#include "../../components/app_node/src/oled.c"
+#include "../../examples/demo-3board/components/app_node/src/oled.c"
 
 #define REC_MAX 64u
 

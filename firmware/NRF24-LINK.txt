@@ -266,7 +266,7 @@ Integration plan as originally written (items 1-8 and 10 done, 7 as RADIO-ARB.tx
     PRIV_REQUIRES (port_nrf24.cpp includes nrf24_regs.h). Until then the
     two port files are not compiled by pio run; they were compile-checked
     by hand (see 9).
- 2. components/app_node/CMakeLists.txt: add app_nrf24_link to REQUIRES (or
+ 2. examples/demo-3board/components/app_node/CMakeLists.txt: add app_nrf24_link to REQUIRES (or
     PRIV_REQUIRES) so node_app.cpp can include nrf24_link.h and
     nrf24_link_hal.h.
  3. BR_NODE_MAX_TRANSPORTS is 2 (br_node.h) and espnow + uart already fill
@@ -466,7 +466,8 @@ run measures.
 Compile verification done instead (no hardware):
 - host: cmake -S firmware/host -B firmware/host/build && cmake --build ...
   && ctest -R nrf24: PASS; same with -DBR_SANITIZE=ON (build-asan): PASS.
-- target: pio run -e esp32_dev (after rm -rf .pio/build/esp32_dev) and
+- target (from examples/demo-3board since the 2026-10-18 layout change):
+  pio run -e esp32_dev (after rm -rf .pio/build/esp32_dev) and
   -e esp32s3_dev build components/app_nrf24_link with -Wall -Wextra
   -Wpedantic -Werror -Wconversion -Wsign-conversion; port_spi.cpp and
   port_nrf24.cpp compiled by hand per chip with the port_espnow.cpp command
@@ -492,4 +493,4 @@ ID. Expected log lines common to all carriers: BRBOOT started ... uart=yes|no
 udp=yes|no nrf=yes|no, BRSTART ... transports=..., BRLINK neighbour 0x....
 via=uart2|udp a.b.c.d:port|nrf24 50:4c:.. and the per-carrier BRSTAT fields
 (uart_* / udp_* / nrf_*) with drop names u_* / ud_* / n_*, present only
-when that link is on. FLASH-DEMO.md section 5 has the ESP-NOW-only lines.
+when that link is on. examples/demo-3board/FLASH-DEMO.md section 5 has the ESP-NOW-only lines.

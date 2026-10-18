@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_console_gateway.c - host test of the single-chip WiFi + nRF24 gateway
- * support in components/app_node/src/node_console.c:
+ * support in examples/demo-3board/components/app_node/src/node_console.c:
  *   - the wifi= key (station decoupled from udp=) and its policies:
  *     wifi=on needs espnow=off and ssid=, udp=on needs wifi=on, a line with
  *     udp= and no wifi= keeps the pre-wifi= coupling, wifi alone is not a
@@ -22,7 +22,7 @@
  */
 #include "test_util.h"
 
-#include "../../components/app_node/src/node_console.c"
+#include "../../examples/demo-3board/components/app_node/src/node_console.c"
 
 static node_cmd_t C;
 

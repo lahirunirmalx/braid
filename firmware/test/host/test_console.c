@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_console.c - host test of the demo console parser and config
- * validation (components/app_node/src/node_console.c, phase 1c).
+ * validation (examples/demo-3board/components/app_node/src/node_console.c, phase 1c).
  *
  * The parser is portable C; this test compiles the real source file into
  * the test executable (no separate host library for app_node).
  */
 #include "test_util.h"
 
-#include "../../components/app_node/src/node_console.c"
+#include "../../examples/demo-3board/components/app_node/src/node_console.c"
 
 static node_cmd_t C;
 

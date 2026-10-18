@@ -5,10 +5,14 @@ Frames travel A -> B -> C. Allowlists force it.
 Variant: let A and C also talk directly, so the demo keeps working with B
 off (section 6a).
 
+Run the `pio` commands below from this directory
+(`firmware/examples/demo-3board`), except the self-test in section 2,
+which builds from `firmware/`.
+
 ## Quick start (repeat runs)
 
 1. Plug in ONE board. `pio device list` -> note port (e.g. /dev/ttyUSB0).
-2. `cd ~/esp32-link-protocol/firmware && pio run -e esp32_dev -t upload --upload-port /dev/ttyUSB0`
+2. `cd ~/esp32-link-protocol/firmware/examples/demo-3board && pio run -e esp32_dev -t upload --upload-port /dev/ttyUSB0`
 3. `pio device monitor -p /dev/ttyUSB0 -b 115200 --echo`, type that board's `br set` line (section 4).
 4. Order: B, then C, then A. Unplug/replug the next board between each.
 5. Power all three. Wait for `BRREADY` on A.
@@ -30,15 +34,15 @@ Radio: ESP-NOW, channel 1 (default `chan=1`), all three boards the same.
 ## 1. Toolchain check (once)
 
 ```
-cd ~/esp32-link-protocol/firmware && pio run -e esp32_dev
+cd ~/esp32-link-protocol/firmware/examples/demo-3board && pio run -e esp32_dev
 ```
 Expect: ends with `[SUCCESS]`.
-Fails with `No module named 'idf_component_manager'`: see "Machine note" in README-BUILD.txt.
+Fails with `No module named 'idf_component_manager'`: see "Machine note" in ../../README-BUILD.txt.
 
 ## 2. Selftest on ONE board (optional, recommended)
 
 ```
-pio run -e esp32_selftest -t upload -t monitor
+cd ~/esp32-link-protocol/firmware && pio run -e esp32_selftest -t upload -t monitor
 ```
 Expect, repeating every 10 s:
 ```
@@ -97,8 +101,8 @@ Console:
 - `br reboot` restart (needed after `br set` on a running board)
 
 Other carriers (not part of this demo; all off by default): `uart=on`
-(UART-LINK.txt), `udp=on` with `espnow=off` (UDP-LINK.txt), `nrf=on`
-(NRF24-LINK.txt). The full key list is in
+(../../UART-LINK.txt), `udp=on` with `espnow=off` (../../UDP-LINK.txt), `nrf=on`
+(../../NRF24-LINK.txt). The full key list is in
 `components/app_node/src/node_console.h`.
 
 Any bad token rejects the whole line (`BRCFG error: ...`). Retype it.
@@ -215,6 +219,25 @@ re-SEEKs (backoff 1 s up to 30 s) over whichever path still works.
 Unplug B and press BOOT on A: with A and C in range the LED still flashes,
 and B (`0102`) drops out of the `nb` line on the status displays after the
 link times out.
+
+## 6b. Range test (board C mobile)
+
+Board C on a laptop USB port, A fixed, BOOT pressed on A while walking:
+```
+~/.platformio/penv/bin/python tools/range_log.py      (from this directory)
+```
+One CSV row per press with hops and `rssi=` (last hop), plus state changes
+and the 5 s BRSTAT line; type a note + Enter to mark a position.
+
+First run (2026-10-18, ESP32 devkits, ESP-NOW channel 1):
+- A - C direct, B off: presses arrived down to about -94 dBm; the session
+  timed out about 20 s after the last one. Treat about -85 dBm as the
+  reliable edge.
+- B placed between them: when the direct path failed, A re-SEEKed and C
+  re-bound through B within the same second (`hops=2`); presses then
+  arrived at -88 to -91 dBm on the B - C hop. A relay too close to the edge
+  of A's range stays silent (it only re-sends what it hears), so place B
+  where both sides see better than about -85 dBm.
 
 ## 7. Troubleshooting
 

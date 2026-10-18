@@ -4,7 +4,7 @@
  * test_console_links.c - host test of the WiFi UDP and nRF24 console keys
  * (espnow= udp= port= mcast= peers= ssid= pass= nrf= nch= nrate= npa=
  * nsck= nmiso= nmosi= ncsn= nce= nirq=) and the transport policies of
- * spec 12.4 in components/app_node/src/node_console.c.
+ * spec 12.4 in examples/demo-3board/components/app_node/src/node_console.c.
  *
  * Kept separate from test_console.c (phase 1c, frozen) and
  * test_console_uart.c (UART link, frozen) on purpose: those files check
@@ -13,7 +13,7 @@
  */
 #include "test_util.h"
 
-#include "../../components/app_node/src/node_console.c"
+#include "../../examples/demo-3board/components/app_node/src/node_console.c"
 
 static node_cmd_t C;
 

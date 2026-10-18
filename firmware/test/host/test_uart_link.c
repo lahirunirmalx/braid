@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_uart_link.c - host test of the UART transport adapter
- * (components/app_node/src/uart_link.c; spec 1.2 UART row, 3.2, 11.3,
+ * (examples/demo-3board/components/app_node/src/uart_link.c; spec 1.2 UART row, 3.2, 11.3,
  * 11.11, C.2; SPEC-NOTES N22, N42, N43).
  *
  * The adapter is portable C; this test compiles the real source file into
@@ -36,7 +36,7 @@
 #include "test_util.h"
 #include "vectors_generated.h"
 
-#include "../../components/app_node/src/uart_link.c"
+#include "../../examples/demo-3board/components/app_node/src/uart_link.c"
 
 /* ========================================================================= */
 /* Fake HAL: capture buffer and frame sink                                    */

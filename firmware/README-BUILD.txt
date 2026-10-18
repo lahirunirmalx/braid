@@ -7,9 +7,17 @@ Toolchain (verified 2026-10-08)
   mbedtls               3.6.5 (the copy inside ESP-IDF; also used by the host build)
   Host                  GCC 15.2, CMake 4.2 (needs >= 3.16)
 
-Device builds (from firmware/)
-  pio run -e esp32_dev      board esp32dev, ESP32-WROOM-32E, 4 MB, partitions.csv
-  pio run -e esp32s3_dev    board esp32-s3-devkitc-1, S3-WROOM-1 N8, 8 MB, partitions_8mb.csv
+Device builds
+  firmware/ is the stack (components/) plus the on-chip self-test image
+  (main/, SELFTEST.txt):
+    pio run -e esp32_selftest     board esp32dev, ESP32-WROOM-32E, 4 MB, partitions.csv
+    pio run -e esp32s3_selftest   board esp32-s3-devkitc-1, S3-WROOM-1 N8, 8 MB, partitions_8mb.csv
+  The 3-board demo application is an example with its own platformio.ini
+  (from firmware/examples/demo-3board/, FLASH-DEMO.md there):
+    pio run -e esp32_dev / esp32s3_dev
+  It pulls the stack from ../../components (EXTRA_COMPONENT_DIRS in its
+  committed CMakeLists.txt) and shares partitions*.csv and version.txt; its
+  sdkconfig.defaults* are copies of firmware/'s (keep them in sync).
   Development posture only: no secure boot, flash encryption, anti-rollback
   or NVS encryption.
 
@@ -42,7 +50,8 @@ Device build note: after adding a source to components/app_braid
 
 Files the build generates in firmware/ (ignored by firmware/.gitignore)
   CMakeLists.txt           written by PlatformIO on the first build; not kept in git
-  sdkconfig.esp32_dev, sdkconfig.esp32s3_dev
+  sdkconfig.esp32_selftest, sdkconfig.esp32s3_selftest (and sdkconfig.esp32_dev /
+  sdkconfig.esp32s3_dev in examples/demo-3board/)
   .pio/, host/build*/
 
 version.txt sets the app version (0.1.0-dev); without it ESP-IDF runs

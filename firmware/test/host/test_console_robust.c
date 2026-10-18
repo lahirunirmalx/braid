@@ -22,7 +22,7 @@
 #include "test_util.h"
 
 #include "../../components/app_hal/include/hal_udp.h"
-#include "../../components/app_node/src/node_console.c"
+#include "../../examples/demo-3board/components/app_node/src/node_console.c"
 
 static node_cmd_t C;
 

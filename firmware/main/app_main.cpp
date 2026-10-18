@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 lahiru
-// app_main.cpp - Braid node supervisor.
+// app_main.cpp - Braid on-chip self-test supervisor.
 //
 // Responsibilities (and nothing more):
 //   1. Boot invariants: persistent store (hal_kv_init, NVS).
 //   2. Bridge app_hal services into the Braid core (br_platform_t).
-//   3. Hand over to the phase 1c demo (components/app_node, node_app_run()):
-//      serial console + NVS configuration, then the pinned tasks of
-//      Appendix B / 12.12, identical on ESP32 and ESP32-S3:
-//        - "br"  core 1 (APP_CPU): the single protocol task (br_task);
-//        - "led" / "btn" core 1: role helpers (probe LED, sender button);
-//        - "con" core 0 (PRO_CPU): serial console.
-//      The radio callbacks run in the Wi-Fi task on core 0 and only enqueue
-//      (timeout 0) for "br". See node_app.cpp for the full layout.
+//   3. Run the self-test.
 //
-// BR_SELFTEST builds (envs esp32_selftest / esp32s3_selftest, see
-// firmware/SELFTEST.txt) replace the demo with one "selftest" task on
-// core 1 that runs br_selftest_run() (Appendix A replay), logs per-group
+// This project (firmware/, envs esp32_selftest / esp32s3_selftest, see
+// firmware/SELFTEST.txt) builds the stack and the self-test only; the
+// 3-board demo application is firmware/examples/demo-3board.
+//
+// One "selftest" task on core 1 runs br_selftest_run() (Appendix A replay), logs per-group
 // timing (br_platform_t.now_us -> hal_sys_time_us -> esp_timer), stack
 // high-water mark and heap before / after, then prints
 // "BR_SELFTEST RESULT: PASS n/n" or "BR_SELFTEST RESULT: FAIL k/n".
@@ -34,14 +29,15 @@
 #include "hal_result.h"
 #include "hal_sys.h"
 
-#include "node_app.h"
 #include "braid/br_platform.h"
 #include "braid/br_types.h"
 
-#if defined(BR_SELFTEST) && BR_SELFTEST
+#if !defined(BR_SELFTEST) || !BR_SELFTEST
+#error "firmware/ builds the self-test only (BR_SELFTEST=1); the demo is firmware/examples/demo-3board"
+#endif
+
 #include "esp_heap_caps.h"
 #include "braid/br_selftest.h"
-#endif
 
 namespace {
 
@@ -73,7 +69,6 @@ void plat_log(void *, br_log_level_t level, const char *tag, const char *msg) {
 
 constexpr br_platform_t kPlatform = {plat_now_us, plat_random, plat_log, nullptr};
 
-#if defined(BR_SELFTEST) && BR_SELFTEST
 // Stack: known worst frames in the core are br_rs_decode 896 B and the CCM
 // path 432 B (+ mbedtls AES / SHA). The selftest keeps frame buffers static,
 // but every log line goes through plat_log -> ESP_LOGx (newlib formatted output,
@@ -147,7 +142,6 @@ void selftest_task(void *) {
         vTaskDelay(kResultRepeat);  // repeat for a monitor attached late; press RST to rerun
     }
 }
-#endif  // BR_SELFTEST
 
 }  // namespace
 
@@ -158,13 +152,9 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(br_platform_set(&kPlatform) == BR_OK ? ESP_OK : ESP_FAIL);
 
-#if defined(BR_SELFTEST) && BR_SELFTEST
-    // Selftest build: only the selftest task, so heap and log are not shared.
+    // Only the selftest task, so heap and log are not shared.
     const BaseType_t st = xTaskCreatePinnedToCore(selftest_task, "selftest", kStackSelftest, nullptr,
                                                   kPrioSelftest, nullptr, kCoreBr);
     ESP_ERROR_CHECK(st == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_LOGI(TAG, "selftest task up on core%d, stack %" PRIu32 " bytes", static_cast<int>(kCoreBr), kStackSelftest);
-#else
-    node_app_run();  // console + config gate, then the role's pinned tasks
-#endif
 }

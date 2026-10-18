@@ -22,7 +22,8 @@
 //
 // 12.4 bridge arbitration: hal_radio_tx_inflight() counts frames between
 // esp_now_send() and their send callback (broadcasts included); the portable
-// radio_arb / espnow_link modules in app_node read it from the protocol task
+// radio_arb / espnow_link modules of an application (today the demo's
+// app_node, examples/demo-3board) read it from the protocol task
 // (firmware/RADIO-ARB.txt).
 
 #include <atomic>

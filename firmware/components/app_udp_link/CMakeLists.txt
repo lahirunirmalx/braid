@@ -10,8 +10,8 @@
 # host/udp_posix.c on the host). Host test: firmware/test/host/test_udp_link.c
 # compiles both files directly.
 #
-# Wired into app_node (udp=on, firmware/UDP-LINK.txt section 3); app_node
-# REQUIRES this component.
+# Used by applications that REQUIRE this component, e.g. the demo's app_node
+# (examples/demo-3board, udp=on, firmware/UDP-LINK.txt section 3).
 idf_component_register(
     SRCS
         "src/udp_link.c"

@@ -18,10 +18,13 @@
    cmake --build firmware/host/build
    ctest --test-dir firmware/host/build
    ```
-2. Both device builds, with zero warnings (from `firmware/`):
+2. Device builds, with zero warnings: the self-test from `firmware/` and
+   the demo from `firmware/examples/demo-3board/`:
    ```
-   pio run -e esp32_dev
-   pio run -e esp32s3_dev
+   pio run -d firmware -e esp32_selftest
+   pio run -d firmware -e esp32s3_selftest
+   pio run -d firmware/examples/demo-3board -e esp32_dev
+   pio run -d firmware/examples/demo-3board -e esp32s3_dev
    ```
 
 ## Spec changes

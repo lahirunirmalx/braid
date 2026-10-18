@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_radio_arb.c - host test of the 12.4 bridge radio arbitration
- * (components/app_node/src/radio_arb.c, espnow_link.c and the nRF24 pump's
+ * (examples/demo-3board/components/app_node/src/radio_arb.c, espnow_link.c and the nRF24 pump's
  * transmit gate in components/app_nrf24_link/src/nrf24_link.c;
  * firmware/RADIO-ARB.txt; PROTOCOL.md v0.8 12.4, C.5; SPEC-NOTES N60).
  *
@@ -41,8 +41,8 @@
 #include "test_util.h"
 #include "vectors_generated.h"
 
-#include "../../components/app_node/src/espnow_link.c"
-#include "../../components/app_node/src/radio_arb.c"
+#include "../../examples/demo-3board/components/app_node/src/espnow_link.c"
+#include "../../examples/demo-3board/components/app_node/src/radio_arb.c"
 #include "../../components/app_nrf24_link/src/nrf24_link.c"
 #include "../../components/app_nrf24_link/src/nrf24_seg.c"
 

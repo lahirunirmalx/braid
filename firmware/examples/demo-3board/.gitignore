@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 lahiru
+# PlatformIO / ESP-IDF build products of this example project
+.pio/
+/sdkconfig.*
+!/sdkconfig.defaults
+!/sdkconfig.defaults.*
+/dependencies.lock
+/managed_components/
+# range_log.py output
+/range-logs/

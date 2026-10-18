@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 lahiru
+# sdkconfig.defaults - Braid DEVELOPMENT baseline (both targets).
+#
+# ESP-IDF also loads sdkconfig.defaults.<target> (esp32, esp32s3) after this
+# file; target-specific keys (flash size, partition table file) live there.
+#
+# Deliberately NOT enabled here (one-way on the device; production overlay
+# only, on explicit request):
+#   CONFIG_SECURE_BOOT_V2_ENABLED, CONFIG_SECURE_FLASH_ENC_ENABLED,
+#   CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE,
+#   CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK, CONFIG_NVS_ENCRYPTION
+
+# --- Watchdogs (Appendix B: nothing blocks longer than the TWDT period) -----
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_INT_WDT=y
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=300
+
+# --- Brownout ---------------------------------------------------------------
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
+
+# --- Stack protection -------------------------------------------------------
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+
+# --- Logging ----------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+
+# --- FreeRTOS diagnostics (stack_hwm, runtime stats) ------------------------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# --- Radio layout (spec 12.12: WiFi on core 0, br_task on core 1) -----------
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+
+# --- Partition table (file name per target, see sdkconfig.defaults.<target>)
+CONFIG_PARTITION_TABLE_CUSTOM=y

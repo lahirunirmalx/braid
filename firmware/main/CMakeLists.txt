@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 lahiru
-# main - supervisor only: boot, wire platform services, hand over to app_node.
+# main - self-test supervisor only: boot, wire platform services, run
+# br_selftest_run(). The demo application is firmware/examples/demo-3board.
 idf_component_register(
     SRCS "app_main.cpp"
-    REQUIRES app_hal port_esp_idf app_braid app_node log freertos esp_system
+    REQUIRES app_hal port_esp_idf app_braid log freertos esp_system
 )
 
 # Strict, but no -Wpedantic here: ESP-IDF include dirs are not -isystem and

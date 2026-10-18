@@ -5,7 +5,8 @@
 // Application code (main/, components/app_*) MUST include this header and
 // never <driver/i2c_master.h>. The translation to ESP-IDF lives in
 // components/port_esp_idf/port_i2c.cpp. Used by the status display
-// (app_node oled.c); not thread-safe: one task owns the bus.
+// (the demo status display, examples/demo-3board oled.c); not thread-safe:
+// one task owns the bus.
 
 #pragma once
 

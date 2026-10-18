@@ -100,14 +100,14 @@ exactly as before.
 4. Files
 --------
 
-    components/app_node/src/radio_arb.[ch]      arbiter: two busy queries, hold, cap, stale rule, counters (portable C11)
-    components/app_node/src/espnow_link.[ch]    ESP-NOW TX deferral: 4-frame static FIFO + pump around the raw send (portable C11)
-    components/app_node/src/radio_arb_hal.[ch]  device glue: radio_arb_setup_board() wires hal_radio_tx_inflight()
+    examples/demo-3board/components/app_node/src/radio_arb.[ch]      arbiter: two busy queries, hold, cap, stale rule, counters (portable C11)
+    examples/demo-3board/components/app_node/src/espnow_link.[ch]    ESP-NOW TX deferral: 4-frame static FIFO + pump around the raw send (portable C11)
+    examples/demo-3board/components/app_node/src/radio_arb_hal.[ch]  device glue: radio_arb_setup_board() wires hal_radio_tx_inflight()
                                                 and nrf24_link_radio_busy(), installs the nRF24 transmit gate
     components/app_nrf24_link/src/nrf24_link.[ch]  pump hook: nrf24_link_set_tx_gate(), asked right before a frame starts
     components/app_hal/include/hal_radio.h      hal_radio_tx_inflight()
     components/port_esp_idf/port_espnow.cpp     the in-flight counter
-    components/app_node/CMakeLists.txt          the three new .c files (SRCS + the strict portable flag set)
+    examples/demo-3board/components/app_node/CMakeLists.txt          the three new .c files (SRCS + the strict portable flag set)
     firmware/test/host/test_radio_arb.c         host test (section 7)
 
 espnow_link: send() = br_transport_t.send of the "espnow" transport. Queue

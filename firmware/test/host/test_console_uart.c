@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 lahiru
 /*
  * test_console_uart.c - host test of the UART link console keys
- * (uart= utx= urx= ubaud=) in components/app_node/src/node_console.c.
+ * (uart= utx= urx= ubaud=) in examples/demo-3board/components/app_node/src/node_console.c.
  *
  * Kept separate from test_console.c (phase 1c, frozen) on purpose: that
  * file still checks that the phase 1c lines and the `br show` text are
@@ -11,7 +11,7 @@
  */
 #include "test_util.h"
 
-#include "../../components/app_node/src/node_console.c"
+#include "../../examples/demo-3board/components/app_node/src/node_console.c"
 
 static node_cmd_t C;
 

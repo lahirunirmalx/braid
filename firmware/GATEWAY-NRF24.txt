@@ -13,7 +13,7 @@ does not care where the WiFi radio goes. So nRF24 mesh + WiFi STA on one chip
 is a valid NEW topology, a variant of 12.4 (SPEC-NOTES N65, v0.9 candidate).
 
 NOT YET RUN ON HARDWARE: no nRF24 module was attached when this was written
-(the user has none yet). Verified by build (esp32_dev, esp32s3_dev, zero
+(the user has none yet). Verified by build (demo envs esp32_dev, esp32s3_dev, zero
 warnings) and host tests only (test_console_gateway.c: console keys,
 policies, the gateway line, the AP / nRF24 clearance rule, the ISO-8601
 formatter; test_console_robust.c: NVS blob fallback, the station reconnect
@@ -22,9 +22,9 @@ the target.
 
 Files:
 
-    components/app_node/src/node_console.[ch]   wifi= / ntp= keys, policies, clearance helper,
+    examples/demo-3board/components/app_node/src/node_console.[ch]   wifi= / ntp= keys, policies, clearance helper,
                                                 BRNRF coexist text, ISO-8601 formatter (portable C11)
-    components/app_node/src/node_app.cpp        start_wifi() (STA + SNTP), wifi_poll(), ntp_poll(),
+    examples/demo-3board/components/app_node/src/node_app.cpp        start_wifi() (STA + SNTP), wifi_poll(), ntp_poll(),
                                                 log_coexist()
     components/app_hal/include/hal_udp.h        hal_udp_wifi_sta_start(), hal_udp_wifi_sta_info(),
                                                 hal_udp_wifi_sta_retry_info(), the reconnect

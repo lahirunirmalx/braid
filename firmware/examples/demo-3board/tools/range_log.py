@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: 2026 lahiru
 # Requires: pyserial (PlatformIO's python has it: ~/.platformio/penv/bin/python)
 # Run:      python3 tools/range_log.py [--port /dev/ttyUSB0] [--out range-logs]
+#           (from firmware/examples/demo-3board; logs land in ./range-logs, git-ignored)
 """Range-test logger for the Braid demo probe (board C).
 
 Reads C's serial console and writes, with a host timestamp on every line:
