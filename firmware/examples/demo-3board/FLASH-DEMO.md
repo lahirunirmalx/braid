@@ -279,6 +279,19 @@ First run (2026-10-18): four boards, allowlists off; C heard the Cardputer
 (-17 dBm, on the desk), B (-52) and A (-78), and copies of A's frames
 arrived through both relays.
 
+Four-node range test (2026-10-18, C fixed on the laptop with
+`tools/range_log.py`, A walked out past a chain C - Cardputer - B): 32
+presses received, 1 direct (-94 dBm, at the edge), 22 over 2 hops and 9 over
+3 hops (A - B - Cardputer - C). The path grew by itself as A moved: each
+time the current one failed, A's session closed and the next SEEK bound over
+the longer chain (`HOP 2 via ...`, then `HOP 3` on A's screen). The last hop
+into C stayed at -82 to -84 dBm, so the Cardputer sat near the edge of C's
+range; place the relay next to the fixed board where it sees -75 or better.
+
+A relay lists only neighbours heard in the last 60 s (link TTL; there are no
+beacons), so an idle relay shows `no neighbours` while still in range. Reset
+A (a fresh SEEK) to see the list fill again.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Try / copy back |
