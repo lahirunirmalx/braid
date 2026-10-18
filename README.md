@@ -17,9 +17,9 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 > ## Status
 >
 > - Protocol specification: **v0.9 (draft)**. Wire version 1, minor 0.
-> - Stack and demo are **host-verified**: 26 test suites (about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios, RFC 3610 CCM vectors).
+> - Stack and demo are **host-verified**: 27 test suites (about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios, RFC 3610 CCM vectors).
 > - Builds for **ESP32** and **ESP32-S3** with ESP-IDF 5.5.3.
-> - **Run on hardware (ESP32 only, 2026-10-18):** on-chip self-test PASS 826/826; 3-board ESP-NOW demo works over 2 hops, directly between A and C, and falls back to the relay when out of range. Not yet run on ESP32-S3.
+> - **Run on hardware (2026-10-18):** ESP32 on-chip self-test PASS 826/826; ESP-NOW demo works over 2 hops, directly between A and C, and falls back to the relay when out of range; an ESP32-S3 (M5Stack Cardputer) joined as a fourth node and relayed.
 > - UART, WiFi UDP and nRF24 carriers have **not been run on hardware**. The **nRF24 register driver has never touched a chip.**
 > - Do not deploy this yet. Treat it as a reviewable design plus a tested core.
 
@@ -58,7 +58,7 @@ Details in PROTOCOL.md section 13.
 
 | Example | What it shows |
 |---|---|
-| [demo-3board](firmware/examples/demo-3board/README.md) | Button on board A to LED on board C over ESP-NOW, relayed by B; serial console config, optional SSD1306 status display, range-test logger |
+| [demo-3board](firmware/examples/demo-3board/README.md) | Button on board A to LED on board C over ESP-NOW, relayed by B (or a 4th board such as an M5Stack Cardputer); serial console config, SSD1306 or ST7789 status display, range-test logger |
 
 ## Quick start
 
@@ -98,7 +98,7 @@ tools/vectors.py       oracle that generates and checks all test vectors
 firmware/
   components/          the stack
     app_braid/         protocol core: CRC, COBS, RS, FEC, ARQ, crypto, sessions, mesh
-    app_hal/           HAL headers (GPIO, UART, SPI, I2C, UDP, radio, KV, time)
+    app_hal/           HAL headers (GPIO, UART, SPI, I2C, LCD, USB serial, UDP, radio, KV, time)
     port_esp_idf/      HAL implementation on ESP-IDF
     app_udp_link/      WiFi UDP carrier
     app_nrf24_link/    nRF24L01+ carrier and register driver

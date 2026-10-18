@@ -117,7 +117,7 @@ All boards, at start:
 BRBOOT starting in 3 s; send br commands now to change the configuration
 BRRADIO espnow chan=1 mac=xx:xx:xx:xx:xx:xx
 BROLED ssd1306 128x64 at 0x3C sda=GPIO21 scl=GPIO22   <- or "BROLED none at 0x3C/0x3D ..." without a display
-BRBOOT started role=<role> id=0x01nn grp=0xFF10 tasks: br@core.. led=<yes|no> btn=<yes|no> con@core.. uart=no udp=no nrf=no wifi=no oled=<yes|no>
+BRBOOT started role=<role> id=0x01nn grp=0xFF10 tasks: br@core.. led=<yes|no> btn=<yes|no> con@core.. uart=no udp=no nrf=no wifi=no disp=<oled|lcd|no>
 BRSTART node 0x01nn txseq=... preseq=... allowlist=on transports=espnow
 ```
 B adds: `BRRELAY forwarding only`
@@ -239,6 +239,46 @@ First run (2026-10-18, ESP32 devkits, ESP-NOW channel 1):
   of A's range stays silent (it only re-sends what it hears), so place B
   where both sides see better than about -85 dBm.
 
+## 6c. Fourth board: M5Stack Cardputer as relay (or sender)
+
+The Cardputer (StampS3, ESP32-S3, 8 MB) has its own env: the S3 image plus
+its built-in ST7789 LCD (SPI3: SCK G36, MOSI G35, CS G37, DC G34, RST G33,
+backlight G38) instead of the I2C display probe. Its only USB port is the
+chip's native one (`/dev/ttyACM0`); the console reads commands there too.
+
+1. Linux only, once: stop ModemManager probing the board. It opens every new
+   `/dev/ttyACM*`, which resets the S3 in a loop (port disconnects every few
+   seconds, or the board sits in `waiting for download`):
+   ```
+   echo 'ATTRS{idVendor}=="303a", ENV{ID_MM_DEVICE_IGNORE}="1"' | sudo tee /etc/udev/rules.d/99-esp32-modemmanager-ignore.rules
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+2. Flash: `pio run -e cardputer -t upload --upload-port /dev/ttyACM0`
+3. Configure (monitor on `/dev/ttyACM0`, as in section 4):
+   `br set role=node id=0x0104 nbr=none` (relay), or
+   `br set role=sender id=0x0104 grp=0xFF10 nbr=none btn=0` (sender on the
+   G0 button). Every role also forwards other boards' frames.
+4. With more than three boards, switch the bench allowlist off on all of
+   them (`br set nbr=none`, then `br reboot`): every board then accepts every
+   neighbour and the mesh picks the path. With lists, every board must list
+   the new id.
+
+Screen (relay): `RELAY 0x0104`, `forwarding` / `no neighbours`, the number
+of frames forwarded in large digits, then one row per neighbour with its
+RSSI, coloured by signal: green >= -75 dBm, orange >= -85 dBm, red below
+(colours come from `components/app_node/src/disp_theme.c`). A relay learns
+neighbours only from frames it hears: while A and C stream directly to each
+other it may show `no neighbours` until A's next SEEK (reset A to see it).
+Sender and probe screens match the OLED layout, in colour.
+
+Stuck in `waiting for download` (ROM bootloader) after a reset storm: unplug
+USB, switch the Cardputer off and on (battery), then plug USB back in
+without pressing any button.
+
+First run (2026-10-18): four boards, allowlists off; C heard the Cardputer
+(-17 dBm, on the desk), B (-52) and A (-78), and copies of A's frames
+arrived through both relays.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Try / copy back |
@@ -260,6 +300,9 @@ First run (2026-10-18, ESP32 devkits, ESP-NOW channel 1):
 | `BROLED none at 0x3C/0x3D` with a display wired | SDA/SCL swapped, no power, or the panel does not ACK at 400 kHz | check GPIO21 = SDA, GPIO22 = SCL, VCC, GND; else lower `kOledHz` in `node_app.cpp` |
 | Display picture shifted by 2 px | SH1106 controller, not SSD1306 | `kOledColOffset = 2` in `node_app.cpp` |
 | Display shows only the top half, or doubled rows | 128x32 panel | the driver is 128x64 only (`k_init` in `oled.c`: `0xA8 0x1F`, `0xDA 0x02`) |
+| Cardputer `/dev/ttyACM0` disconnects every few seconds | ModemManager probing the port resets the S3 | udev rule in section 6c |
+| Cardputer prints only `waiting for download` | download mode latched by repeated USB resets | power-cycle on battery (section 6c) |
+| Cardputer LCD shifted, mirrored or wrong colours | panel offset / MADCTL | `kLcdXOff`, `kLcdYOff`, `kLcdMadctl` in `node_app.cpp` |
 
 ## 8. If it fails: send back
 

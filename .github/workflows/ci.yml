@@ -122,6 +122,8 @@ jobs:
             dir: firmware/examples/demo-3board
           - env: esp32s3_dev
             dir: firmware/examples/demo-3board
+          - env: cardputer
+            dir: firmware/examples/demo-3board
     steps:
       - uses: actions/checkout@v4
 

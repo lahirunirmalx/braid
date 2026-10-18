@@ -14,7 +14,7 @@ Device builds
     pio run -e esp32s3_selftest   board esp32-s3-devkitc-1, S3-WROOM-1 N8, 8 MB, partitions_8mb.csv
   The 3-board demo application is an example with its own platformio.ini
   (from firmware/examples/demo-3board/, FLASH-DEMO.md there):
-    pio run -e esp32_dev / esp32s3_dev
+    pio run -e esp32_dev / esp32s3_dev / cardputer (M5Stack Cardputer, ST7789 LCD)
   It pulls the stack from ../../components (EXTRA_COMPONENT_DIRS in its
   committed CMakeLists.txt) and shares partitions*.csv and version.txt; its
   sdkconfig.defaults* are copies of firmware/'s (keep them in sync).

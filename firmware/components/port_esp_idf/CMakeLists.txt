@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 lahiru
 # port_esp_idf - the ONLY component that includes ESP-IDF driver headers
-# (GPIO, UART console and UART link, SPI master, I2C master), the Wi-Fi / ESP-NOW radio
+# (GPIO, UART console and UART link, SPI master, I2C master, the SPI LCD bus,
+# the native USB serial receive FIFO), the Wi-Fi / ESP-NOW radio
 # headers, the lwIP sockets (WiFi UDP link, esp_wifi STA) and the lwIP SNTP
 # client (port_sntp.cpp, esp_netif_sntp; hal_time.h). Implements the
 # app_hal interfaces. port_nrf24.cpp drives the portable register sequence
@@ -12,6 +13,7 @@ idf_component_register(
         "port_gpio.cpp"
         "port_i2c.cpp"
         "port_kv.cpp"
+        "port_lcd.cpp"
         "port_nrf24.cpp"
         "port_result.cpp"
         "port_sntp.cpp"
@@ -19,6 +21,7 @@ idf_component_register(
         "port_sys.cpp"
         "port_uart.cpp"
         "port_uart_link.cpp"
+        "port_usb_serial.cpp"
         "port_udp.cpp"
     REQUIRES app_hal
     PRIV_REQUIRES esp_driver_gpio esp_driver_i2c esp_driver_uart esp_driver_spi esp_timer esp_hw_support esp_system log

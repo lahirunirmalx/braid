@@ -76,6 +76,7 @@
 // counted (ud_qdrop). The remaining slots keep room for TX-status, nRF24 IRQ
 // and app events.
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cstdarg>
@@ -92,6 +93,7 @@
 #include "hal_gpio.h"
 #include "hal_i2c.h"
 #include "hal_kv.h"
+#include "hal_lcd.h"
 #include "hal_nrf24.h"
 #include "hal_radio.h"
 #include "hal_result.h"
@@ -100,12 +102,14 @@
 #include "hal_uart.h"
 #include "hal_uart_link.h"
 #include "hal_udp.h"
+#include "hal_usb_serial.h"
 
 #include "braid/br_node.h"
 #include "braid/br_sample.h"
 #include "braid/br_session.h"
 #include "braid/br_tables.h"
 
+#include "disp_theme.h"
 #include "node_app.h"
 #include "node_console.h"
 #include "nrf24_link.h"
@@ -114,8 +118,13 @@
 #include "espnow_link.h"
 #include "radio_arb.h"
 #include "radio_arb_hal.h"
+#include "st7789.h"
 #include "uart_link.h"
 #include "udp_link.h"
+
+#ifndef NODE_BOARD_CARDPUTER
+#define NODE_BOARD_CARDPUTER 0  // 1: M5Stack Cardputer build (env cardputer): ST7789 LCD instead of the I2C probe
+#endif
 
 namespace {
 
@@ -568,11 +577,13 @@ struct DispSnap {
     int8_t   rssi;                        // probe: last-hop RSSI of the last sample, 0 = none
     uint8_t  n_nb;
     uint16_t nb[kDispNb];                 // live neighbours (link table, unexpired)
+    int8_t   nb_rssi[kDispNb];            // their RSSI EWMA, BR_RSSI_UNKNOWN on wired carriers
     uint32_t presses;
     uint32_t delivered;
     uint32_t tx;
     uint32_t rx;
     uint32_t auth_fail;
+    uint32_t fwd;                         // frames this node relayed (every role forwards)
     uint32_t flashes;                     // bumps start an inverted blink
     char     state[12];
     char     event[OLED_COLS + 1];
@@ -1544,11 +1555,13 @@ void disp_publish() {
         d.tx = s.f.tx_frames;
         d.rx = s.f.rx_frames;
         d.auth_fail = s.f.auth_fail;
+        d.fwd = s.f.relay_fwd;
     }
     d.hops = 0;
     d.via = 0;
     d.n_nb = 0;
     std::memset(d.nb, 0, sizeof d.nb);
+    std::memset(d.nb_rssi, 0, sizeof d.nb_rssi);
     const br_tables_t *t = nullptr;
     if (br_node_get_tables(&g_node, &t) == BR_OK && t != nullptr) {
         const uint32_t now_ms = br_ms_from_us(hal_sys_time_us());
@@ -1562,7 +1575,10 @@ void disp_publish() {
             if (e.transport == BR_NO_TRANSPORT || e.unit_id == 0 || !br_ms_before(now_ms, e.expiry_ms)) continue;
             bool dup = false;
             for (uint8_t i = 0; i < d.n_nb; i++) dup = dup || d.nb[i] == e.unit_id;
-            if (!dup && d.n_nb < kDispNb) d.nb[d.n_nb++] = e.unit_id;
+            if (!dup && d.n_nb < kDispNb) {
+                d.nb_rssi[d.n_nb] = e.rssi_ewma;
+                d.nb[d.n_nb++] = e.unit_id;
+            }
         }
     }
     if (xSemaphoreTake(g_disp_lock, 0) != pdTRUE) return;  // "disp" is copying: next pass
@@ -1723,9 +1739,9 @@ void button_task(void *) {
 
 // ---- status display ("disp") -------------------------------------------------
 
-uint8_t g_oled_addr = OLED_ADDR;  // 0x3C, or 0x3D when the module has SA0 high
+[[maybe_unused]] uint8_t g_oled_addr = OLED_ADDR;  // 0x3C, or 0x3D when the module has SA0 high
 
-bool disp_write(void *, const uint8_t *buf, size_t len) {
+[[maybe_unused]] bool disp_write(void *, const uint8_t *buf, size_t len) {
     return hal_i2c_write(g_oled_addr, buf, len, kOledIoMs) == HAL_OK;
 }
 
@@ -1738,65 +1754,191 @@ const char *disp_role_name(uint8_t role) {
     }
 }
 
-// 21 x 8 text cells; rows 2-3 hold the double-size hop count.
-//   0  SENDER 0x0101          role, own id
-//   1  STREAMING              session state
-//   2  HOP 2   peer 0103      hop count (x2), peer
-//   3          via 0102       next hop, or "direct"
-//   4  press 3 ack 6          sender: presses, acked / probe: value, received, RSSI
-//   5  tx 12 rx 13 auth 0     frame counters
-//   6  nb 0102 0103           live neighbours
-//   7  LED x5 from 0x0101     last event
-void disp_render(oled_t *o, const DispSnap &s) {
-    char line[40];  // longer than a row on purpose: oled_text clips at OLED_COLS
-    oled_clear(o);
-    (void)std::snprintf(line, sizeof line, "%s 0x%04X", disp_role_name(g_run.role), g_run.uid);
-    oled_text(o, 0, 0, line);
-    oled_text(o, 1, 0, s.state);
-    if (s.hops != 0) {
-        (void)std::snprintf(line, sizeof line, "HOP %u", s.hops);
+// Backend-neutral screen: 8 text rows of 21 cells plus a large figure.
+// Rows 2-3 are split: the large figure (double size) on the left, row[2] /
+// row[3] text from cell 11 on the right. Colours are theme roles.
+//   sender / probe                  relay
+//   0  SENDER 0x0101                RELAY 0x0104
+//   1  STREAMING                    forwarding
+//   2  HOP 2     peer 0103          12        forwarded
+//   3            via  0102                    frames
+//   4  press 3 ack 6                0101 -71dBm      (neighbours with RSSI,
+//   5  tx 12 rx 13 fwd 0            0103 -80dBm       then counters)
+//   6  nb 0102 0103                 tx 12 rx 13 fwd 12
+//   7  LED x5 from 0x0101           last event
+struct DispRow {
+    char    text[OLED_COLS + 1];
+    uint8_t color;
+};
+struct DispView {
+    DispRow row[OLED_ROWS];
+    char    big[8];     // drawn 5 cells wide ("HOP 2", "12345")
+    uint8_t big_color;
+};
+
+void row_set(DispRow &r, disp_color_t color, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+void row_set(DispRow &r, disp_color_t color, const char *fmt, ...) {
+    char wide[40];  // longer than a row on purpose: the row keeps its first 21 cells
+    va_list ap;
+    va_start(ap, fmt);
+    (void)std::vsnprintf(wide, sizeof wide, fmt, ap);
+    va_end(ap);
+    std::memset(r.text, 0, sizeof r.text);
+    std::memcpy(r.text, wide, std::min(std::strlen(wide), sizeof r.text - 1));
+    r.color = static_cast<uint8_t>(color);
+}
+
+disp_color_t state_color(const char *state) {
+    if (std::strcmp(state, "STREAMING") == 0) return DISP_C_GOOD;
+    if (std::strcmp(state, "CLOSED") == 0 || std::strcmp(state, "none") == 0) return DISP_C_BAD;
+    return DISP_C_WARN;
+}
+
+void stats_row(DispRow &r, const DispSnap &s) {
+    if (s.auth_fail != 0) {
+        row_set(r, DISP_C_BAD, "tx %" PRIu32 " rx %" PRIu32 " AUTH %" PRIu32, s.tx, s.rx, s.auth_fail);
     } else {
-        (void)std::snprintf(line, sizeof line, "HOP -");
+        row_set(r, DISP_C_DIM, "tx %" PRIu32 " rx %" PRIu32 " fwd %" PRIu32, s.tx, s.rx, s.fwd);
     }
-    oled_text_x2(o, 2, 0, line);
+}
+
+void disp_build(const DispSnap &s, DispView &v) {
+    std::memset(&v, 0, sizeof v);
+    row_set(v.row[0], DISP_C_TITLE, "%s 0x%04X", disp_role_name(g_run.role), g_run.uid);
+    if (g_run.role == NODE_ROLE_NODE) {
+        if (s.n_nb == 0) {
+            row_set(v.row[1], DISP_C_WARN, "no neighbours");
+        } else {
+            row_set(v.row[1], DISP_C_GOOD, "forwarding");
+        }
+        (void)std::snprintf(v.big, sizeof v.big, "%" PRIu32, s.fwd > 99999u ? 99999u : s.fwd);
+        v.big_color = DISP_C_ACCENT;
+        row_set(v.row[2], DISP_C_FG, "forwarded");
+        row_set(v.row[3], DISP_C_DIM, "frames");
+        unsigned r = 4;
+        for (uint8_t i = 0; i < s.n_nb && r < 7; i++, r++) {
+            if (s.nb_rssi[i] == BR_RSSI_UNKNOWN) {
+                row_set(v.row[r], DISP_C_FG, "%04X  wired", s.nb[i]);
+            } else {
+                row_set(v.row[r], disp_theme_rssi(s.nb_rssi[i]), "%04X  %ddBm", s.nb[i], s.nb_rssi[i]);
+            }
+        }
+        if (s.n_nb == 0) row_set(v.row[r++], DISP_C_WARN, "nb none");
+        if (r < 7) stats_row(v.row[r], s);
+        row_set(v.row[7], DISP_C_DIM, "%s", s.event);
+        return;
+    }
+    row_set(v.row[1], state_color(s.state), "%s", s.state);
+    if (s.hops != 0) {
+        (void)std::snprintf(v.big, sizeof v.big, "HOP %u", s.hops);
+    } else {
+        (void)std::snprintf(v.big, sizeof v.big, "HOP -");
+    }
+    v.big_color = DISP_C_ACCENT;
     if (s.peer != 0) {
-        (void)std::snprintf(line, sizeof line, "%s %04X", g_run.role == NODE_ROLE_PROBE ? "from" : "peer", s.peer);
-        oled_text(o, 2, 11, line);
+        row_set(v.row[2], DISP_C_FG, "%s %04X", g_run.role == NODE_ROLE_PROBE ? "from" : "peer", s.peer);
         if (s.hops == 1) {
-            oled_text(o, 3, 11, "direct");
+            row_set(v.row[3], DISP_C_GOOD, "direct");
         } else if (s.via != 0) {
-            (void)std::snprintf(line, sizeof line, "via  %04X", s.via);
-            oled_text(o, 3, 11, line);
+            row_set(v.row[3], DISP_C_WARN, "via  %04X", s.via);
         }
     }
     if (g_run.role == NODE_ROLE_SENDER) {
-        (void)std::snprintf(line, sizeof line, "press %" PRIu32 " ack %" PRIu32, s.presses, s.delivered);
-    } else if (g_run.role == NODE_ROLE_PROBE) {
-        if (s.rssi != 0) {
-            (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32 " %ddBm", s.last_val, s.delivered, s.rssi);
-        } else {
-            (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32, s.last_val, s.delivered);
-        }
+        row_set(v.row[4], DISP_C_FG, "press %" PRIu32 " ack %" PRIu32, s.presses, s.delivered);
+    } else if (s.rssi != 0) {
+        row_set(v.row[4], disp_theme_rssi(s.rssi), "value %u rx %" PRIu32 " %ddBm", s.last_val, s.delivered, s.rssi);
     } else {
-        line[0] = '\0';
+        row_set(v.row[4], DISP_C_FG, "value %u rx %" PRIu32, s.last_val, s.delivered);
     }
-    oled_text(o, 4, 0, line);
-    (void)std::snprintf(line, sizeof line, "tx %" PRIu32 " rx %" PRIu32 " auth %" PRIu32, s.tx, s.rx, s.auth_fail);
-    oled_text(o, 5, 0, line);
-    int n = std::snprintf(line, sizeof line, "nb");
-    if (s.n_nb == 0) (void)std::snprintf(line + n, sizeof line - static_cast<size_t>(n), " none");
-    for (uint8_t i = 0; i < s.n_nb && n > 0 && static_cast<size_t>(n) < sizeof line; i++) {
-        n += std::snprintf(line + n, sizeof line - static_cast<size_t>(n), " %04X", s.nb[i]);
+    stats_row(v.row[5], s);
+    char nb[40];
+    int n = std::snprintf(nb, sizeof nb, "nb");
+    if (s.n_nb == 0) (void)std::snprintf(nb + n, sizeof nb - static_cast<size_t>(n), " none");
+    for (uint8_t i = 0; i < s.n_nb && n > 0 && static_cast<size_t>(n) < sizeof nb; i++) {
+        n += std::snprintf(nb + n, sizeof nb - static_cast<size_t>(n), " %04X", s.nb[i]);
     }
-    oled_text(o, 6, 0, line);
-    oled_text(o, 7, 0, s.event);
+    row_set(v.row[6], s.n_nb == 0 ? DISP_C_WARN : DISP_C_FG, "%s", nb);
+    row_set(v.row[7], DISP_C_DIM, "%s", s.event);
 }
 
+// ---- backends: draw a DispView, blink (flip) the whole screen ----------------
+
+struct DispBackend {
+    const char *name;
+    bool (*draw)(const DispView &v);
+    bool (*flip)(bool on);
+};
+
 oled_t g_oled;  // 1 KB frame buffer, kept off the "disp" stack
+
+bool oled_draw(const DispView &v) {
+    oled_clear(&g_oled);
+    for (unsigned r = 0; r < OLED_ROWS; r++) {
+        oled_text(&g_oled, r, (r == 2 || r == 3) ? 11 : 0, v.row[r].text);
+    }
+    oled_text_x2(&g_oled, 2, 0, v.big);
+    return oled_flush(&g_oled);
+}
+
+bool oled_flip(bool on) { return oled_invert(&g_oled, on); }
+
+constexpr DispBackend kOledBackend = {"oled", oled_draw, oled_flip};
+
+#if NODE_BOARD_CARDPUTER
+// M5Stack Cardputer (StampS3): ST7789V2 1.14" IPS, 135 x 240, used landscape.
+constexpr hal_lcd_cfg_t kLcdPins = {36, 35, 37, 34, 33, 38, 40000000};  // sck mosi cs dc rst bl, clock
+constexpr uint16_t kLcdW = 240;
+constexpr uint16_t kLcdH = 135;
+constexpr uint16_t kLcdXOff = 40;     // panel RAM offset of the visible window (landscape)
+constexpr uint16_t kLcdYOff = 53;
+constexpr uint8_t  kLcdMadctl = 0x60; // MX | MV: landscape, RGB order
+constexpr unsigned kLcdScale = 2;     // 12 x 16 px cells: 20 columns x 8 rows
+constexpr unsigned kLcdCellW = 6 * kLcdScale;
+constexpr unsigned kLcdRowH = 8 * kLcdScale;
+constexpr unsigned kLcdCols = kLcdW / kLcdCellW;
+
+st7789_t g_lcd;
+DispView g_lcd_shown;  // rows already on the panel: unchanged rows are not resent
+bool g_lcd_valid = false;
+
+bool lcd_cmd(void *, uint8_t cmd, const uint8_t *params, size_t len) {
+    return hal_lcd_cmd(cmd, params, len) == HAL_OK;
+}
+bool lcd_data(void *, const uint8_t *data, size_t len) { return hal_lcd_data(data, len) == HAL_OK; }
+void lcd_delay(void *, uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+
+bool lcd_draw(const DispView &v) {
+    const disp_palette_t *pal = disp_theme_palette();
+    bool ok = true;
+    for (unsigned r = 0; r < OLED_ROWS; r++) {
+        const bool split = (r == 2 || r == 3);
+        if (g_lcd_valid && std::memcmp(&g_lcd_shown.row[r], &v.row[r], sizeof v.row[r]) == 0) continue;
+        const unsigned col = split ? 11 : 0;
+        ok = st7789_text(&g_lcd, col * kLcdCellW, r * kLcdRowH, v.row[r].text, kLcdCols - col, kLcdScale,
+                         pal->fg[v.row[r].color], pal->bg) && ok;
+    }
+    if (!g_lcd_valid || std::strcmp(g_lcd_shown.big, v.big) != 0 || g_lcd_shown.big_color != v.big_color) {
+        // Rows 2-3 left half: 5 cells of 24 x 32 px, then a 12 px gap column.
+        ok = st7789_text(&g_lcd, 0, 2 * kLcdRowH, v.big, 5, 2 * kLcdScale, pal->fg[v.big_color], pal->bg) && ok;
+        ok = st7789_fill(&g_lcd, 5 * 2 * kLcdCellW, 2 * kLcdRowH, 11 * kLcdCellW - 5 * 2 * kLcdCellW, 2 * kLcdRowH,
+                         pal->bg) && ok;
+    }
+    std::memcpy(&g_lcd_shown, &v, sizeof v);
+    g_lcd_valid = ok;
+    return ok;
+}
+
+bool lcd_flip(bool on) { return st7789_flip(&g_lcd, on); }
+
+constexpr DispBackend kLcdBackend = {"lcd", lcd_draw, lcd_flip};
+#endif
+
+const DispBackend *g_disp_be = nullptr;
 
 // The panel is initialised by start_display() before this task exists.
 void disp_task(void *) {
     const uint32_t inv_ms = g_run.role == NODE_ROLE_PROBE ? kDispInvProbeMs : kDispInvSenderMs;
+    static DispView view;
     DispSnap shown;
     DispSnap cur;
     std::memset(&shown, 0, sizeof shown);
@@ -1818,16 +1960,16 @@ void disp_task(void *) {
         const bool want_inv = static_cast<int32_t>(inv_until - now) > 0;
         bool ok = true;
         if (want_inv != inverted) {
-            ok = oled_invert(&g_oled, want_inv);
+            ok = g_disp_be->flip(want_inv);
             inverted = want_inv;
         }
         if (first || std::memcmp(&cur, &shown, sizeof cur) != 0) {
-            disp_render(&g_oled, cur);
-            ok = oled_flush(&g_oled) && ok;
+            disp_build(cur, view);
+            ok = g_disp_be->draw(view) && ok;
             std::memcpy(&shown, &cur, sizeof shown);
             first = false;
         }
-        if (!ok && io_fail++ == 0) ESP_LOGW(TAG, "BROLED write failed (display unplugged?); retrying");
+        if (!ok && io_fail++ == 0) ESP_LOGW(TAG, "BRDISP %s write failed (display unplugged?); retrying", g_disp_be->name);
         if (ok) io_fail = 0;
         vTaskDelay(pdMS_TO_TICKS(kDispGapMs));
     }
@@ -1843,7 +1985,60 @@ bool oled_pin_in_use(const node_cfg_t &c, uint8_t pin) {
     return false;
 }
 
-// Probe the display once; start "disp" when it answers.
+bool disp_task_start() {
+    std::memset(&g_disp_br, 0, sizeof g_disp_br);
+    std::memset(&g_disp_pub, 0, sizeof g_disp_pub);
+    g_disp_lock = xSemaphoreCreateMutexStatic(&g_disp_lock_buf);
+    if (g_disp_lock == nullptr ||
+        xTaskCreatePinnedToCore(disp_task, "disp", kStackDisp, nullptr, kPrioDisp, &g_disp_task, kCoreApp) !=
+            pdPASS) {
+        ESP_LOGE(TAG, "BRDISP task create failed");
+        g_disp_task = nullptr;
+        return false;
+    }
+    return true;
+}
+
+#if NODE_BOARD_CARDPUTER
+// The Cardputer's built-in LCD: write-only, nothing to probe.
+void start_display(const node_cfg_t &c) {
+    const uint8_t pins[] = {36, 35, 37, 34, 33, 38};
+    for (uint8_t p : pins) {
+        if (oled_pin_in_use(c, p)) {
+            ESP_LOGW(TAG, "BRLCD skipped: GPIO%u used by the configuration", p);
+            return;
+        }
+    }
+    hal_result_t r = hal_lcd_init(&kLcdPins);
+    if (r == HAL_OK) r = hal_lcd_reset();
+    if (r != HAL_OK) {
+        ESP_LOGE(TAG, "BRLCD bus init failed (%s): display off", hal_result_name(r));
+        return;
+    }
+    std::memset(&g_lcd, 0, sizeof g_lcd);
+    g_lcd.cmd = lcd_cmd;
+    g_lcd.data = lcd_data;
+    g_lcd.delay = lcd_delay;
+    g_lcd.width = kLcdW;
+    g_lcd.height = kLcdH;
+    g_lcd.x_off = kLcdXOff;
+    g_lcd.y_off = kLcdYOff;
+    g_lcd.madctl = kLcdMadctl;
+    g_lcd.invert = true;
+    if (!st7789_init(&g_lcd) || !st7789_fill(&g_lcd, 0, 0, kLcdW, kLcdH, disp_theme_palette()->bg) ||
+        hal_lcd_backlight(true) != HAL_OK) {
+        ESP_LOGE(TAG, "BRLCD init failed: display off");
+        return;
+    }
+    g_disp_be = &kLcdBackend;
+    if (disp_task_start()) {
+        ESP_LOGI(TAG, "BRLCD st7789 %ux%u sck=GPIO%d mosi=GPIO%d cs=GPIO%d dc=GPIO%d rst=GPIO%d bl=GPIO%d", kLcdW,
+                 kLcdH, kLcdPins.sck_pin, kLcdPins.mosi_pin, kLcdPins.cs_pin, kLcdPins.dc_pin, kLcdPins.rst_pin,
+                 kLcdPins.bl_pin);
+    }
+}
+#else
+// Probe the I2C display once; start "disp" when it answers.
 void start_display(const node_cfg_t &c) {
     if (oled_pin_in_use(c, kOledSda) || oled_pin_in_use(c, kOledScl)) {
         ESP_LOGI(TAG, "BROLED skipped: GPIO%u / GPIO%u used by the configuration", kOledSda, kOledScl);
@@ -1867,18 +2062,12 @@ void start_display(const node_cfg_t &c) {
         ESP_LOGE(TAG, "BROLED init sequence not acknowledged: display off");
         return;
     }
-    std::memset(&g_disp_br, 0, sizeof g_disp_br);
-    std::memset(&g_disp_pub, 0, sizeof g_disp_pub);
-    g_disp_lock = xSemaphoreCreateMutexStatic(&g_disp_lock_buf);
-    if (g_disp_lock == nullptr ||
-        xTaskCreatePinnedToCore(disp_task, "disp", kStackDisp, nullptr, kPrioDisp, &g_disp_task, kCoreApp) !=
-            pdPASS) {
-        ESP_LOGE(TAG, "BROLED task create failed");
-        g_disp_task = nullptr;
-        return;
+    g_disp_be = &kOledBackend;
+    if (disp_task_start()) {
+        ESP_LOGI(TAG, "BROLED ssd1306 128x64 at 0x%02X sda=GPIO%u scl=GPIO%u", g_oled_addr, kOledSda, kOledScl);
     }
-    ESP_LOGI(TAG, "BROLED ssd1306 128x64 at 0x%02X sda=GPIO%u scl=GPIO%u", g_oled_addr, kOledSda, kOledScl);
 }
+#endif
 
 // ---- console -----------------------------------------------------------------
 
@@ -2018,13 +2207,17 @@ void console_task(void *) {
         vTaskDelete(nullptr);
         return;
     }
+    // Boards whose only USB connector is the chip's own (Cardputer, S3
+    // native port) type into USB Serial/JTAG: poll it between UART0 reads.
+    const bool usb = hal_usb_serial_present();
     static char line[NODE_LINE_MAX + 1];
     size_t len = 0;
     bool overflow = false;
     uint8_t chunk[32];
     for (;;) {
         size_t got = 0;
-        if (hal_uart_read(kUart, chunk, sizeof chunk, 200, &got) != HAL_OK) continue;
+        if (hal_uart_read(kUart, chunk, sizeof chunk, usb ? 50 : 200, &got) != HAL_OK) continue;
+        if (got == 0 && usb && hal_usb_serial_read(chunk, sizeof chunk, &got) != HAL_OK) got = 0;
         for (size_t i = 0; i < got; i++) {
             const uint8_t ch = chunk[i];
             if (ch == '\r' || ch == '\n') {
@@ -2280,11 +2473,11 @@ bool start_role(const node_cfg_t &c) {
     g_started.store(true);
     ESP_LOGI(TAG,
              "BRBOOT started role=%s id=0x%04X grp=0x%04X tasks: br@core%d led=%s btn=%s con@core%d uart=%s udp=%s "
-             "nrf=%s wifi=%s oled=%s",
+             "nrf=%s wifi=%s disp=%s",
              node_role_name(c.role), c.uid, c.grp, static_cast<int>(kCoreApp), g_led_task ? "yes" : "no",
              g_btn_task ? "yes" : "no", static_cast<int>(kCoreNet), g_uart_on ? "yes" : "no",
              g_udp_on ? "yes" : "no", g_nrf_on ? "yes" : "no", g_wifi_on ? "yes" : "no",
-             g_disp_task ? "yes" : "no");
+             g_disp_task != nullptr && g_disp_be != nullptr ? g_disp_be->name : "no");
     return true;
 }
 

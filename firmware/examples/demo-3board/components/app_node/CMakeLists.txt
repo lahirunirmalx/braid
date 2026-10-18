@@ -6,10 +6,12 @@
 # optional WiFi UDP link (app_udp_link, LAN side, spec 12.4) and the optional
 # nRF24L01+ link (app_nrf24_link), and the sender / relay / probe roles
 # (button, LED, BRSTAT line), and the optional status display (src/oled.c,
-# SSD1306 over hal_i2c, autodetected; portable C11, test_oled.c).
+# SSD1306 over hal_i2c, autodetected; portable C11, test_oled.c) or, in the
+# cardputer env, the ST7789 LCD over hal_lcd (src/st7789.c, test_st7789.c),
+# coloured through src/disp_theme.c.
 #
 # Talks to hardware only through app_hal (hal_radio, hal_gpio, hal_uart,
-# hal_kv, hal_sys, hal_uart_link, hal_udp, hal_nrf24, hal_i2c); no driver, Wi-Fi,
+# hal_kv, hal_sys, hal_uart_link, hal_udp, hal_nrf24, hal_i2c, hal_lcd, hal_usb_serial); no driver, Wi-Fi,
 # ESP-NOW or lwIP headers here. src/node_console.c and src/uart_link.c are
 # portable C11 and host-tested (firmware/test/host/test_console*.c and
 # test_uart_link.c compile them directly).
@@ -25,6 +27,8 @@ idf_component_register(
         "src/radio_arb_hal.c"
         "src/espnow_link.c"
         "src/oled.c"
+        "src/st7789.c"
+        "src/disp_theme.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES app_braid app_udp_link app_nrf24_link
@@ -44,5 +48,5 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wsign-compare           # IDF globally sets -Wno-sign-compare
     -Wshadow
 )
-set_source_files_properties(src/node_console.c src/uart_link.c src/radio_arb.c src/radio_arb_hal.c src/espnow_link.c src/oled.c PROPERTIES COMPILE_OPTIONS
+set_source_files_properties(src/node_console.c src/uart_link.c src/radio_arb.c src/radio_arb_hal.c src/espnow_link.c src/oled.c src/st7789.c src/disp_theme.c PROPERTIES COMPILE_OPTIONS
     "-Wpedantic;-Wconversion;-Wsign-conversion;-Wstrict-prototypes")
