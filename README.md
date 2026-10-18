@@ -17,6 +17,7 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 > ## Status
 >
 > - Protocol specification: **v0.9 (draft)**. Wire version 1, minor 0.
+> - Firmware release: **v0.9.0** (pre-release; prebuilt images on the [Releases](https://github.com/lahirunirmalx/braid/releases) page).
 > - Stack and demo are **host-verified**: 27 test suites (about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios, RFC 3610 CCM vectors).
 > - Builds for **ESP32** and **ESP32-S3** with ESP-IDF 5.5.3.
 > - **Run on hardware (2026-10-18):** ESP32 on-chip self-test PASS 826/826; ESP-NOW demo works over 2 hops, directly between A and C, and falls back to the relay when out of range; an ESP32-S3 (M5Stack Cardputer) joined as a fourth node and relayed.

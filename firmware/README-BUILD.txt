@@ -54,7 +54,7 @@ Files the build generates in firmware/ (ignored by firmware/.gitignore)
   sdkconfig.esp32s3_dev in examples/demo-3board/)
   .pio/, host/build*/
 
-version.txt sets the app version (0.1.0-dev); without it ESP-IDF runs
+version.txt sets the app version (0.9.0, also used by examples/); without it ESP-IDF runs
 `git describe`, which fails while the repo has no commits.
 
 Machine note: PlatformIO's Python here is 3.14, but the espressif32@6.13.0
