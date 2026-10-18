@@ -170,9 +170,9 @@ BRACK s=.. seq=.. acked=2
 ```
 C prints:
 ```
-BRRX src=0x0101 hops=2 seq=.. value=1
+BRRX src=0x0101 hops=2 seq=.. value=1 rssi=-nn
 BREDGE src=0x0101 hops=2 0->1: LED x5
-BRRX src=0x0101 hops=2 seq=.. value=0
+BRRX src=0x0101 hops=2 seq=.. value=0 rssi=-nn
 ```
 C's LED flashes 5 times.
 
@@ -205,7 +205,7 @@ each one to the other's list, then reboot:
 B is unchanged. The mesh takes the cheapest path, so while A and C hear each
 other they bind directly and B carries nothing:
 ```
-BRRX src=0x0101 hops=1 seq=.. value=1        <- on C
+BRRX src=0x0101 hops=1 seq=.. value=1 rssi=-nn <- on C
 ```
 B is used only when A and C are out of each other's range (different rooms):
 then C shows `hops=2` again. Both cases (B unplugged, and the fallback through

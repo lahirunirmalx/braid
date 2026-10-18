@@ -543,6 +543,7 @@ uint32_t g_bench_drop = 0;                // ESP-NOW frames refused by the bench
 uint32_t g_send_refused = 0;              // transport send() not queued by the radio
 uint32_t g_mac_ok = 0;
 uint32_t g_mac_fail = 0;
+int8_t   g_rx_rssi = 0;                   // RSSI of the ESP-NOW frame inside br_node_rx (0 = other carrier)
 bool     g_reseek_pending = false;
 uint64_t g_reseek_at_us = 0;
 uint64_t g_reseek_backoff_us = kReseekMinUs;
@@ -564,6 +565,7 @@ struct DispSnap {
     uint16_t via;                         // next hop toward peer (route table); 0 = no route
     uint8_t  hops;                        // 0 = unknown
     uint8_t  last_val;
+    int8_t   rssi;                        // probe: last-hop RSSI of the last sample, 0 = none
     uint8_t  n_nb;
     uint16_t nb[kDispNb];                 // live neighbours (link table, unexpired)
     uint32_t presses;
@@ -888,7 +890,8 @@ void cb_samples(void *, const br_samples_meta_t *meta, const br_mode_t *mode, co
             continue;
         }
         const uint8_t v = static_cast<uint8_t>(vals[0].lines & 1u);
-        ESP_LOGI(TAG, "BRRX src=0x%04X hops=%u seq=%u value=%u", meta->src_id, meta->hops, meta->seq, v);
+        ESP_LOGI(TAG, "BRRX src=0x%04X hops=%u seq=%u value=%u rssi=%d", meta->src_id, meta->hops, meta->seq, v,
+                 g_rx_rssi);
         if (lv->val == 0 && v == 1) {
             ESP_LOGI(TAG, "BREDGE src=0x%04X hops=%u 0->1: LED x%" PRIu32, meta->src_id, meta->hops, kLedFlashes);
             if (g_led_task != nullptr) xTaskNotifyGive(g_led_task);
@@ -898,6 +901,7 @@ void cb_samples(void *, const br_samples_meta_t *meta, const br_mode_t *mode, co
         lv->val = v;
         g_disp_br.peer = meta->src_id;
         g_disp_br.last_val = v;
+        g_disp_br.rssi = g_rx_rssi;
     }
 }
 
@@ -1073,7 +1077,9 @@ void handle_event(const Evt &e) {
             std::memcpy(m.addr, e.addr, HAL_RADIO_ADDR_LEN);
             m.addr_len = HAL_RADIO_ADDR_LEN;
             m.rssi = e.rssi;
+            g_rx_rssi = e.rssi;  // last hop's signal, for BRRX (callbacks run inside br_node_rx)
             (void)br_node_rx(&g_node, e.data, e.len, g_link_espnow, &m, nullptr);
+            g_rx_rssi = 0;
             break;
         }
         case kEvtUartRx:
@@ -1737,12 +1743,12 @@ const char *disp_role_name(uint8_t role) {
 //   1  STREAMING              session state
 //   2  HOP 2   peer 0103      hop count (x2), peer
 //   3          via 0102       next hop, or "direct"
-//   4  press 3 ack 6          sender: presses, acked / probe: value, received
+//   4  press 3 ack 6          sender: presses, acked / probe: value, received, RSSI
 //   5  tx 12 rx 13 auth 0     frame counters
 //   6  nb 0102 0103           live neighbours
 //   7  LED x5 from 0x0101     last event
 void disp_render(oled_t *o, const DispSnap &s) {
-    char line[OLED_COLS + 1];
+    char line[40];  // longer than a row on purpose: oled_text clips at OLED_COLS
     oled_clear(o);
     (void)std::snprintf(line, sizeof line, "%s 0x%04X", disp_role_name(g_run.role), g_run.uid);
     oled_text(o, 0, 0, line);
@@ -1766,7 +1772,11 @@ void disp_render(oled_t *o, const DispSnap &s) {
     if (g_run.role == NODE_ROLE_SENDER) {
         (void)std::snprintf(line, sizeof line, "press %" PRIu32 " ack %" PRIu32, s.presses, s.delivered);
     } else if (g_run.role == NODE_ROLE_PROBE) {
-        (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32, s.last_val, s.delivered);
+        if (s.rssi != 0) {
+            (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32 " %ddBm", s.last_val, s.delivered, s.rssi);
+        } else {
+            (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32, s.last_val, s.delivered);
+        }
     } else {
         line[0] = '\0';
     }

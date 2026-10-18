@@ -16,3 +16,4 @@ build*/
 *.key
 keys/
 GITHUB-ABOUT.txt
+range-logs/
