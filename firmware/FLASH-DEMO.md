@@ -2,6 +2,8 @@
 
 Boards: 3 x ESP32-WROOM (original ESP32). Dev build only (no secure boot / encryption).
 Frames travel A -> B -> C. Allowlists force it.
+Variant: let A and C also talk directly, so the demo keeps working with B
+off (section 6a).
 
 ## Quick start (repeat runs)
 
@@ -110,7 +112,8 @@ All boards, at start:
 ```
 BRBOOT starting in 3 s; send br commands now to change the configuration
 BRRADIO espnow chan=1 mac=xx:xx:xx:xx:xx:xx
-BRBOOT started role=<role> id=0x01nn grp=0xFF10 tasks: br@core.. led=<yes|no> btn=<yes|no> con@core.. uart=no udp=no nrf=no
+BROLED ssd1306 128x64 at 0x3C sda=GPIO21 scl=GPIO22   <- or "BROLED none at 0x3C/0x3D ..." without a display
+BRBOOT started role=<role> id=0x01nn grp=0xFF10 tasks: br@core.. led=<yes|no> btn=<yes|no> con@core.. uart=no udp=no nrf=no wifi=no oled=<yes|no>
 BRSTART node 0x01nn txseq=... preseq=... allowlist=on transports=espnow
 ```
 B adds: `BRRELAY forwarding only`
@@ -118,6 +121,15 @@ C adds: `BRLISTEN group 0xFF10 rc=0` (LED task `led=yes`)
 A adds: `BRSEEKING group 0xFF10 (s=..)` and `btn=yes`
 
 In this demo every board says `uart=no udp=no nrf=no` and `transports=espnow`.
+
+Status display (optional): an SSD1306 128x64 I2C module on SDA GPIO21 /
+SCL GPIO22 (ESP32; S3: GPIO8 / GPIO9), address 0x3C or 0x3D, is found at
+start; nothing to configure. It shows role and id, session state, `HOP n`
+with the peer and next hop (`direct` or `via 0102`), counters, live
+neighbours (`nb`) and the last event, and inverts while C's LED flashes.
+Skipped when led, btn or an enabled carrier already uses GPIO21 / GPIO22.
+SH1106 panels (picture shifted 2 px): set `kOledColOffset = 2` in
+`components/app_node/src/node_app.cpp`.
 Boards with another carrier on also print a `BRUART ...`, `BRWIFI ...` /
 `BRUDP ...` or `BRNRF ...` line here and list it in `transports=` (joined
 by `+`, e.g. `transports=espnow+uart`); see the carrier's own notes file.
@@ -178,6 +190,31 @@ when non-zero. With every carrier off the line is the phase 1c line.
 
 BRPRESS `ignored: session SEEKING` = A not streaming yet. Wait for `BRREADY`.
 
+`relay_fwd=1` on C is normal: a probe is not a leaf, so it re-floods A's
+group SEEK once in case more group members sit beyond it.
+
+## 6a. Variant: direct A - C, B optional
+
+The section 4 allowlists only admit B, so every frame takes two hops. To let
+A and C also reach each other directly (and keep working with B off), add
+each one to the other's list, then reboot:
+
+- A: `br set nbr=0x0102,0x0103` then `br reboot`
+- C: `br set nbr=0x0101,0x0102` then `br reboot`
+
+B is unchanged. The mesh takes the cheapest path, so while A and C hear each
+other they bind directly and B carries nothing:
+```
+BRRX src=0x0101 hops=1 seq=.. value=1        <- on C
+```
+B is used only when A and C are out of each other's range (different rooms):
+then C shows `hops=2` again. If the active path dies, A's session closes and
+re-SEEKs (backoff 1 s up to 30 s) over whichever path still works.
+
+Unplug B and press BOOT on A: with A and C in range the LED still flashes,
+and B (`0102`) drops out of the `nb` line on the status displays after the
+link times out.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | Try / copy back |
@@ -194,6 +231,11 @@ BRPRESS `ignored: session SEEKING` = A not streaming yet. Wait for `BRREADY`.
 | `BRPRESS ignored` | session not STREAMING | wait for `BRREADY` |
 | A `BRCLOSED`, then `BRRESEEK` | link lost; re-SEEK backoff 1 s up to 30 s | check B/C still powered; copy back logs |
 | Flash fails to connect | wrong port, or board needs BOOT held at `Connecting...` | `pio device list`; hold BOOT while `Connecting....` shows |
+| Reboot loop: `E BOD: Brownout detector was triggered` right after `phy_init` | supply sags when the radio starts (`sdkconfig.defaults` uses brownout level 7, about 2.8 V) | another USB cable / port, 100 uF across 3V3-GND, or use another board |
+| Board restarts each time the monitor opens | CH340 boards: opening the port toggles EN | expected; that board re-binds (A re-SEEKs). Keep one monitor open instead of reopening |
+| `BROLED none at 0x3C/0x3D` with a display wired | SDA/SCL swapped, no power, or the panel does not ACK at 400 kHz | check GPIO21 = SDA, GPIO22 = SCL, VCC, GND; else lower `kOledHz` in `node_app.cpp` |
+| Display picture shifted by 2 px | SH1106 controller, not SSD1306 | `kOledColOffset = 2` in `node_app.cpp` |
+| Display shows only the top half, or doubled rows | 128x32 panel | the driver is 128x64 only (`k_init` in `oled.c`: `0xA8 0x1F`, `0xDA 0x02`) |
 
 ## 8. If it fails: send back
 

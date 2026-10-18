@@ -18,6 +18,11 @@
 //   "btn"    core 1, prio 4, 3072 B  sender only: 10 ms polled button,
 //                                    30 ms debounce (3 equal reads).
 //   "con"    core 0, prio 2, 6144 B  serial console (UART0, line based).
+//   "disp"   core 1, prio 1, 3072 B  only when a status display answers at
+//                                    start (oled.c, SSD1306 128x64, I2C):
+//                                    redraws from a snapshot "br" publishes,
+//                                    at most every 200 ms; never calls
+//                                    br_node_*.
 //   "ulrx<n>" core 0, prio 6, 3072 B UART link receive task (port_uart_link,
 //                                    only with uart=on): copies byte chunks
 //                                    into the event queue with timeout 0.
@@ -73,6 +78,8 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #include "esp_log.h"
@@ -83,6 +90,7 @@
 #include "sdkconfig.h"
 
 #include "hal_gpio.h"
+#include "hal_i2c.h"
 #include "hal_kv.h"
 #include "hal_nrf24.h"
 #include "hal_radio.h"
@@ -102,6 +110,7 @@
 #include "node_console.h"
 #include "nrf24_link.h"
 #include "nrf24_link_hal.h"
+#include "oled.h"
 #include "espnow_link.h"
 #include "radio_arb.h"
 #include "radio_arb_hal.h"
@@ -130,12 +139,14 @@ constexpr UBaseType_t kPrioBr  = tskIDLE_PRIORITY + 5;
 constexpr UBaseType_t kPrioBtn = tskIDLE_PRIORITY + 4;
 constexpr UBaseType_t kPrioLed = tskIDLE_PRIORITY + 3;
 constexpr UBaseType_t kPrioCon = tskIDLE_PRIORITY + 2;
+constexpr UBaseType_t kPrioDisp = tskIDLE_PRIORITY + 1;
 
 constexpr uint32_t kStackBr    = 8192;
 constexpr uint32_t kStackLed   = 3072;
 constexpr uint32_t kStackBtn   = 3072;
 constexpr uint32_t kStackCon   = 6144;   // node_cfg_t copies (peers, ssid, pass) + NODE_SHOW_MAX line + ESP_LOG
 constexpr uint32_t kStackUdpRx = 3072;
+constexpr uint32_t kStackDisp  = 3072;
 
 constexpr uint32_t kRxFrames   = BR_RX_QUEUE_FRAMES;  // 16
 constexpr uint32_t kUdpRxSlots = kRxFrames / 2;        // UDP's share: any LAN host can send, pre-authentication
@@ -151,6 +162,23 @@ constexpr uint32_t kLedFlashes = 5;
 constexpr uint32_t kLedHalfMs  = 200;
 constexpr uint32_t kBtnPollMs  = 10;
 constexpr uint8_t  kBtnStable  = 3;              // 3 x 10 ms = 30 ms debounce
+
+// Status display (oled.c): SSD1306 128x64 at 0x3C (else 0x3D), probed once at start and
+// skipped when absent or when a configured pin already uses SDA / SCL.
+#if CONFIG_IDF_TARGET_ESP32S3
+constexpr uint8_t kOledSda = 8;
+constexpr uint8_t kOledScl = 9;
+#else
+constexpr uint8_t kOledSda = 21;                 // ESP32 devkit I2C pins
+constexpr uint8_t kOledScl = 22;
+#endif
+constexpr uint32_t kOledHz        = 400000;
+constexpr uint8_t  kOledColOffset = 0;           // 2 for SH1106 panels (picture shifted by 2 px)
+constexpr uint32_t kOledIoMs      = 50;
+constexpr uint32_t kDispGapMs     = 200;         // minimum time between two redraws
+constexpr uint32_t kDispIdleMs    = 1000;        // redraw check without a notification
+constexpr uint32_t kDispInvProbeMs  = kLedFlashes * 2 * kLedHalfMs;  // inverted while the LED flashes
+constexpr uint32_t kDispInvSenderMs = 400;       // short inverted blink per sent press
 
 constexpr uint32_t kWifiTimeoutMs = 15000;       // hal_udp_wifi_sta_start() wait for an IP
 constexpr uint64_t kWifiPollDownUs = 1000000;    // station state poll while not associated
@@ -526,6 +554,43 @@ constexpr size_t kLinksLogged = 16;
 struct LoggedLink { uint16_t unit; uint8_t transport; };
 LoggedLink g_links_logged[kLinksLogged] = {};
 
+// Status display snapshot. "br" fills g_disp_br (callbacks and the end of
+// each loop pass) and copies it to g_disp_pub under g_disp_lock when it
+// changed; "disp" copies g_disp_pub out and draws. Plain bytes, copied with
+// memcpy and compared with memcmp (zeroed padding).
+constexpr size_t kDispNb = 3;
+struct DispSnap {
+    uint16_t peer;                        // sender: bound probe; probe: last sender; 0 = none
+    uint16_t via;                         // next hop toward peer (route table); 0 = no route
+    uint8_t  hops;                        // 0 = unknown
+    uint8_t  last_val;
+    uint8_t  n_nb;
+    uint16_t nb[kDispNb];                 // live neighbours (link table, unexpired)
+    uint32_t presses;
+    uint32_t delivered;
+    uint32_t tx;
+    uint32_t rx;
+    uint32_t auth_fail;
+    uint32_t flashes;                     // bumps start an inverted blink
+    char     state[12];
+    char     event[OLED_COLS + 1];
+};
+DispSnap g_disp_br;                       // owned by "br"
+DispSnap g_disp_pub;                      // under g_disp_lock
+StaticSemaphore_t g_disp_lock_buf;
+SemaphoreHandle_t g_disp_lock = nullptr;
+TaskHandle_t g_disp_task = nullptr;
+
+void disp_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void disp_event(const char *fmt, ...) {
+    if (g_disp_task == nullptr) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::memset(g_disp_br.event, 0, sizeof g_disp_br.event);
+    (void)std::vsnprintf(g_disp_br.event, sizeof g_disp_br.event, fmt, ap);
+    va_end(ap);
+}
+
 // Transport indices (kNoLink when absent). Set in node_init_from() before any
 // frame is handled; the g_*_on flags are set in start_role() before "br" runs
 // and never change.
@@ -786,6 +851,8 @@ void cb_seek_result(void *, br_session_t s, br_err_t result, uint16_t probe_id, 
 
 void cb_bound(void *, br_session_t s, uint16_t peer_id) {
     ESP_LOGI(TAG, "BRBOUND s=0x%02X peer=0x%04X", s, peer_id);
+    g_disp_br.peer = peer_id;
+    disp_event("bound to 0x%04X", peer_id);
 }
 
 void cb_mode(void *, br_session_t s, const br_mode_t *mode) {
@@ -825,8 +892,12 @@ void cb_samples(void *, const br_samples_meta_t *meta, const br_mode_t *mode, co
         if (lv->val == 0 && v == 1) {
             ESP_LOGI(TAG, "BREDGE src=0x%04X hops=%u 0->1: LED x%" PRIu32, meta->src_id, meta->hops, kLedFlashes);
             if (g_led_task != nullptr) xTaskNotifyGive(g_led_task);
+            g_disp_br.flashes++;
+            disp_event("LED x%" PRIu32 " from 0x%04X", kLedFlashes, meta->src_id);
         }
         lv->val = v;
+        g_disp_br.peer = meta->src_id;
+        g_disp_br.last_val = v;
     }
 }
 
@@ -846,6 +917,8 @@ void cb_acked(void *, br_session_t s, uint16_t seq) {
 void cb_closed(void *, br_session_t s, uint8_t reason) {
     ESP_LOGW(TAG, "BRCLOSED s=0x%02X reason=%u", s, reason);
     if (is_sender_handle(s)) schedule_reseek("session closed");
+    g_disp_br.peer = 0;
+    disp_event("closed (reason %u)", reason);
 }
 
 void cb_state(void *, br_session_t s, uint8_t old_state, uint8_t new_state) {
@@ -855,6 +928,7 @@ void cb_state(void *, br_session_t s, uint8_t old_state, uint8_t new_state) {
             g_reseek_backoff_us = kReseekMinUs;
             g_reseek_pending = false;
             ESP_LOGI(TAG, "BRREADY streaming to group 0x%04X: press BOOT (GPIO%u)", g_run.grp, g_run.btn);
+            disp_event("ready: press BOOT");
         }
     } else {
         ESP_LOGI(TAG, "BRSTATE probe rec=%u %s -> %s", s & 0x7Fu, prb_state_name(old_state),
@@ -866,9 +940,11 @@ void cb_event(void *, uint16_t event, uint32_t arg) {
     switch (event) {
         case BR_EVT_NO_PROBE:
             ESP_LOGW(TAG, "BREVT no probe answered for 0x%04" PRIX32 " yet (still seeking)", arg);
+            disp_event("no probe answered yet");
             break;
         case BR_EVT_ID_COLLISION:
             ESP_LOGE(TAG, "BREVT ID collision: unit 0x%04" PRIX32 " (two boards with the same id?)", arg);
+            disp_event("ID COLLISION 0x%04" PRIX32, arg);
             break;
         case BR_EVT_LINK_FAIL:
             ESP_LOGW(TAG, "BREVT link to 0x%04" PRIX32 " deleted after repeated MAC failures", arg & 0xFFFFu);
@@ -908,6 +984,7 @@ void sender_start() {
     rc = br_node_set_mode(&g_node, g_sess, &m);
     if (rc != BR_OK) ESP_LOGE(TAG, "BRMODE set failed rc=%d", static_cast<int>(rc));
     ESP_LOGI(TAG, "BRSEEKING group 0x%04X (s=%u)", g_run.grp, g_sess);
+    disp_event("seeking group 0x%04X", g_run.grp);
 }
 
 void sender_press() {
@@ -917,6 +994,7 @@ void sender_press() {
         st != BR_SND_STREAMING) {
         ESP_LOGW(TAG, "BRPRESS n=%" PRIu32 " ignored: session %s", g_presses,
                  g_sess == BR_SESSION_NONE ? "none" : snd_state_name(st));
+        disp_event("press %" PRIu32 " ignored", g_presses);
         return;
     }
     // Each press sends value 1 then value 0 (two DATA frames, both ACK_REQ),
@@ -930,6 +1008,8 @@ void sender_press() {
     }
     ESP_LOGI(TAG, "BRPRESS n=%" PRIu32 " sent value 1 rc=%d, value 0 rc=%d", g_presses, static_cast<int>(rc[0]),
              static_cast<int>(rc[1]));
+    g_disp_br.flashes++;
+    disp_event("press %" PRIu32 " sent 1,0", g_presses);
 }
 
 void sender_after_tick(uint64_t now) {
@@ -1442,6 +1522,50 @@ bool node_init_from(const node_cfg_t &c) {
     return true;
 }
 
+// ---- status display snapshot ("br") -------------------------------------------
+
+// Fill the polled fields of g_disp_br and publish it when anything changed.
+// Cheap (a stats copy and two table scans); runs once per loop pass of "br".
+void disp_publish() {
+    if (g_disp_task == nullptr) return;
+    DispSnap &d = g_disp_br;
+    std::memset(d.state, 0, sizeof d.state);
+    std::strncpy(d.state, session_summary(), sizeof d.state - 1);
+    d.presses = g_presses;
+    d.delivered = g_delivered;
+    br_stats_t s;
+    if (br_node_get_stats(&g_node, &s) == BR_OK) {
+        d.tx = s.f.tx_frames;
+        d.rx = s.f.rx_frames;
+        d.auth_fail = s.f.auth_fail;
+    }
+    d.hops = 0;
+    d.via = 0;
+    d.n_nb = 0;
+    std::memset(d.nb, 0, sizeof d.nb);
+    const br_tables_t *t = nullptr;
+    if (br_node_get_tables(&g_node, &t) == BR_OK && t != nullptr) {
+        const uint32_t now_ms = br_ms_from_us(hal_sys_time_us());
+        for (const auto &r : t->route.e) {
+            if (d.peer != 0 && r.dst_id == d.peer && br_ms_before(now_ms, r.expiry_ms)) {
+                d.hops = r.hops;
+                d.via = r.next_hop;
+            }
+        }
+        for (const auto &e : t->link.e) {
+            if (e.transport == BR_NO_TRANSPORT || e.unit_id == 0 || !br_ms_before(now_ms, e.expiry_ms)) continue;
+            bool dup = false;
+            for (uint8_t i = 0; i < d.n_nb; i++) dup = dup || d.nb[i] == e.unit_id;
+            if (!dup && d.n_nb < kDispNb) d.nb[d.n_nb++] = e.unit_id;
+        }
+    }
+    if (xSemaphoreTake(g_disp_lock, 0) != pdTRUE) return;  // "disp" is copying: next pass
+    const bool changed = std::memcmp(&g_disp_pub, &d, sizeof d) != 0;
+    if (changed) std::memcpy(&g_disp_pub, &d, sizeof d);
+    xSemaphoreGive(g_disp_lock);
+    if (changed) xTaskNotifyGive(g_disp_task);
+}
+
 TickType_t wait_ticks(uint64_t now, uint64_t wake) {
     if (wake <= now) return 0;
     uint64_t us = wake - now;
@@ -1528,6 +1652,7 @@ void br_task(void *) {
             print_stats();
             if (now >= next_stats) next_stats = now + kStatsPeriodUs;
         }
+        disp_publish();
         (void)hal_sys_wdt_feed();
     }
 }
@@ -1588,6 +1713,161 @@ void button_task(void *) {
         stable = raw;
         if (!stable) post_app_event(kEvtPress);  // pressed = low
     }
+}
+
+// ---- status display ("disp") -------------------------------------------------
+
+uint8_t g_oled_addr = OLED_ADDR;  // 0x3C, or 0x3D when the module has SA0 high
+
+bool disp_write(void *, const uint8_t *buf, size_t len) {
+    return hal_i2c_write(g_oled_addr, buf, len, kOledIoMs) == HAL_OK;
+}
+
+const char *disp_role_name(uint8_t role) {
+    switch (role) {
+        case NODE_ROLE_SENDER: return "SENDER";
+        case NODE_ROLE_PROBE:  return "PROBE";
+        case NODE_ROLE_NODE:   return "RELAY";
+        default:               return "?";
+    }
+}
+
+// 21 x 8 text cells; rows 2-3 hold the double-size hop count.
+//   0  SENDER 0x0101          role, own id
+//   1  STREAMING              session state
+//   2  HOP 2   peer 0103      hop count (x2), peer
+//   3          via 0102       next hop, or "direct"
+//   4  press 3 ack 6          sender: presses, acked / probe: value, received
+//   5  tx 12 rx 13 auth 0     frame counters
+//   6  nb 0102 0103           live neighbours
+//   7  LED x5 from 0x0101     last event
+void disp_render(oled_t *o, const DispSnap &s) {
+    char line[OLED_COLS + 1];
+    oled_clear(o);
+    (void)std::snprintf(line, sizeof line, "%s 0x%04X", disp_role_name(g_run.role), g_run.uid);
+    oled_text(o, 0, 0, line);
+    oled_text(o, 1, 0, s.state);
+    if (s.hops != 0) {
+        (void)std::snprintf(line, sizeof line, "HOP %u", s.hops);
+    } else {
+        (void)std::snprintf(line, sizeof line, "HOP -");
+    }
+    oled_text_x2(o, 2, 0, line);
+    if (s.peer != 0) {
+        (void)std::snprintf(line, sizeof line, "%s %04X", g_run.role == NODE_ROLE_PROBE ? "from" : "peer", s.peer);
+        oled_text(o, 2, 11, line);
+        if (s.hops == 1) {
+            oled_text(o, 3, 11, "direct");
+        } else if (s.via != 0) {
+            (void)std::snprintf(line, sizeof line, "via  %04X", s.via);
+            oled_text(o, 3, 11, line);
+        }
+    }
+    if (g_run.role == NODE_ROLE_SENDER) {
+        (void)std::snprintf(line, sizeof line, "press %" PRIu32 " ack %" PRIu32, s.presses, s.delivered);
+    } else if (g_run.role == NODE_ROLE_PROBE) {
+        (void)std::snprintf(line, sizeof line, "value %u rx %" PRIu32, s.last_val, s.delivered);
+    } else {
+        line[0] = '\0';
+    }
+    oled_text(o, 4, 0, line);
+    (void)std::snprintf(line, sizeof line, "tx %" PRIu32 " rx %" PRIu32 " auth %" PRIu32, s.tx, s.rx, s.auth_fail);
+    oled_text(o, 5, 0, line);
+    int n = std::snprintf(line, sizeof line, "nb");
+    if (s.n_nb == 0) (void)std::snprintf(line + n, sizeof line - static_cast<size_t>(n), " none");
+    for (uint8_t i = 0; i < s.n_nb && n > 0 && static_cast<size_t>(n) < sizeof line; i++) {
+        n += std::snprintf(line + n, sizeof line - static_cast<size_t>(n), " %04X", s.nb[i]);
+    }
+    oled_text(o, 6, 0, line);
+    oled_text(o, 7, 0, s.event);
+}
+
+oled_t g_oled;  // 1 KB frame buffer, kept off the "disp" stack
+
+// The panel is initialised by start_display() before this task exists.
+void disp_task(void *) {
+    const uint32_t inv_ms = g_run.role == NODE_ROLE_PROBE ? kDispInvProbeMs : kDispInvSenderMs;
+    DispSnap shown;
+    DispSnap cur;
+    std::memset(&shown, 0, sizeof shown);
+    bool first = true;
+    bool inverted = false;
+    uint32_t flashes = 0;
+    TickType_t inv_until = 0;
+    uint32_t io_fail = 0;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(inverted ? kDispGapMs : kDispIdleMs));
+        if (xSemaphoreTake(g_disp_lock, portMAX_DELAY) != pdTRUE) continue;
+        std::memcpy(&cur, &g_disp_pub, sizeof cur);
+        xSemaphoreGive(g_disp_lock);
+        const TickType_t now = xTaskGetTickCount();
+        if (cur.flashes != flashes) {
+            flashes = cur.flashes;
+            inv_until = now + pdMS_TO_TICKS(inv_ms);
+        }
+        const bool want_inv = static_cast<int32_t>(inv_until - now) > 0;
+        bool ok = true;
+        if (want_inv != inverted) {
+            ok = oled_invert(&g_oled, want_inv);
+            inverted = want_inv;
+        }
+        if (first || std::memcmp(&cur, &shown, sizeof cur) != 0) {
+            disp_render(&g_oled, cur);
+            ok = oled_flush(&g_oled) && ok;
+            std::memcpy(&shown, &cur, sizeof shown);
+            first = false;
+        }
+        if (!ok && io_fail++ == 0) ESP_LOGW(TAG, "BROLED write failed (display unplugged?); retrying");
+        if (ok) io_fail = 0;
+        vTaskDelay(pdMS_TO_TICKS(kDispGapMs));
+    }
+}
+
+bool oled_pin_in_use(const node_cfg_t &c, uint8_t pin) {
+    if (pin == c.led || pin == c.btn) return true;
+    if (c.uart != 0 && (pin == c.utx || pin == c.urx)) return true;
+    if (c.nrf != 0 && (pin == c.nsck || pin == c.nmiso || pin == c.nmosi || pin == c.ncsn || pin == c.nce ||
+                       pin == c.nirq)) {
+        return true;
+    }
+    return false;
+}
+
+// Probe the display once; start "disp" when it answers.
+void start_display(const node_cfg_t &c) {
+    if (oled_pin_in_use(c, kOledSda) || oled_pin_in_use(c, kOledScl)) {
+        ESP_LOGI(TAG, "BROLED skipped: GPIO%u / GPIO%u used by the configuration", kOledSda, kOledScl);
+        return;
+    }
+    hal_result_t r = hal_i2c_init(kOledSda, kOledScl, kOledHz);
+    if (r == HAL_OK) {
+        r = hal_i2c_probe(OLED_ADDR, kOledIoMs);
+        if (r != HAL_OK && hal_i2c_probe(OLED_ADDR + 1u, kOledIoMs) == HAL_OK) {
+            g_oled_addr = OLED_ADDR + 1u;
+            r = HAL_OK;
+        }
+    }
+    if (r != HAL_OK) {
+        ESP_LOGI(TAG, "BROLED none at 0x%02X/0x%02X sda=GPIO%u scl=GPIO%u (%s)", static_cast<unsigned>(OLED_ADDR),
+                 static_cast<unsigned>(OLED_ADDR + 1u), kOledSda, kOledScl, hal_result_name(r));
+        return;
+    }
+    oled_setup(&g_oled, disp_write, nullptr, kOledColOffset);
+    if (!oled_init(&g_oled)) {
+        ESP_LOGE(TAG, "BROLED init sequence not acknowledged: display off");
+        return;
+    }
+    std::memset(&g_disp_br, 0, sizeof g_disp_br);
+    std::memset(&g_disp_pub, 0, sizeof g_disp_pub);
+    g_disp_lock = xSemaphoreCreateMutexStatic(&g_disp_lock_buf);
+    if (g_disp_lock == nullptr ||
+        xTaskCreatePinnedToCore(disp_task, "disp", kStackDisp, nullptr, kPrioDisp, &g_disp_task, kCoreApp) !=
+            pdPASS) {
+        ESP_LOGE(TAG, "BROLED task create failed");
+        g_disp_task = nullptr;
+        return;
+    }
+    ESP_LOGI(TAG, "BROLED ssd1306 128x64 at 0x%02X sda=GPIO%u scl=GPIO%u", g_oled_addr, kOledSda, kOledScl);
 }
 
 // ---- console -----------------------------------------------------------------
@@ -1976,6 +2256,7 @@ bool start_role(const node_cfg_t &c) {
             g_led_task = nullptr;
         }
     }
+    start_display(c);  // before "br": its first loop pass publishes the snapshot
     if (xTaskCreatePinnedToCore(br_task, "br", kStackBr, nullptr, kPrioBr, &g_br_task, kCoreApp) != pdPASS) {
         ESP_LOGE(TAG, "BRBOOT br task create failed");
         return false;
@@ -1989,10 +2270,11 @@ bool start_role(const node_cfg_t &c) {
     g_started.store(true);
     ESP_LOGI(TAG,
              "BRBOOT started role=%s id=0x%04X grp=0x%04X tasks: br@core%d led=%s btn=%s con@core%d uart=%s udp=%s "
-             "nrf=%s wifi=%s",
+             "nrf=%s wifi=%s oled=%s",
              node_role_name(c.role), c.uid, c.grp, static_cast<int>(kCoreApp), g_led_task ? "yes" : "no",
              g_btn_task ? "yes" : "no", static_cast<int>(kCoreNet), g_uart_on ? "yes" : "no",
-             g_udp_on ? "yes" : "no", g_nrf_on ? "yes" : "no", g_wifi_on ? "yes" : "no");
+             g_udp_on ? "yes" : "no", g_nrf_on ? "yes" : "no", g_wifi_on ? "yes" : "no",
+             g_disp_task ? "yes" : "no");
     return true;
 }
 

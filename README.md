@@ -19,8 +19,8 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 > - Protocol specification: **v0.9 (draft)**. Wire version 1, minor 0.
 > - Firmware is **host-verified**: 25 test suites (including about 1M frames of fuzzing, ASan/UBSan runs, mesh simulator scenarios and RFC 3610 CCM vectors).
 > - Builds for **ESP32** and **ESP32-S3** with ESP-IDF 5.5.3.
-> - **NOT YET RUN ON HARDWARE.** The first 3-board demo is documented but has not been flashed.
-> - The **nRF24 register driver has never touched a chip.**
+> - **First hardware run (ESP32 only, 2026-10-18):** the on-chip self-test passes (826/826, zero heap delta) and the 3-board ESP-NOW demo works (button on A, relayed by B, LED on C, `hops=2`, `auth_fail=0`). With the allowlists opened, A and C also bind directly (`hops=1`). Optional SSD1306 status displays ran on A and C. Not yet run on ESP32-S3.
+> - UART, WiFi UDP and nRF24 carriers have **not been run on hardware**. The **nRF24 register driver has never touched a chip.**
 > - Do not deploy this yet. Treat it as a reviewable design plus a tested core.
 
 ## What it is
@@ -35,7 +35,7 @@ A multi-carrier mesh data-link stack for ESP32: one protocol over ESP-NOW, UART,
 
 | Carrier | Role | Status |
 |---|---|---|
-| ESP-NOW | Primary mesh radio | Implemented, host-verified, not run on hardware |
+| ESP-NOW | Primary mesh radio | Implemented, host-verified, 3-board demo run on ESP32 |
 | UART | Wired point-to-point, RAW framing (COBS) | Implemented, host-verified, not run on hardware |
 | WiFi UDP | LAN carrier, gateway side | Implemented, host-verified, not run on hardware |
 | nRF24L01+ | Second mesh radio / bridge | Implemented; register driver never touched a chip |
@@ -78,7 +78,7 @@ pio run -e esp32_selftest -t upload -t monitor
 
 It prints `BR_SELFTEST RESULT: PASS n/n` on success.
 
-3-board demo (button on board A, relay B, LED on board C): see [firmware/FLASH-DEMO.md](firmware/FLASH-DEMO.md).
+3-board demo (button on board A, relay B, LED on board C): see [firmware/FLASH-DEMO.md](firmware/FLASH-DEMO.md). An SSD1306 128x64 I2C display on GPIO21 (SDA) / GPIO22 (SCL) is picked up automatically and shows the session, hop count and route.
 
 Builds here are development builds only: no Secure Boot, flash encryption or anti-rollback.
 
@@ -96,7 +96,8 @@ firmware/
     app_braid/         protocol core: CRC, COBS, RS, FEC, ARQ, crypto, sessions, mesh
     app_hal/           HAL headers (GPIO, UART, SPI, UDP, radio, KV, time)
     port_esp_idf/      HAL implementation on ESP-IDF
-    app_node/          node app, console, ESP-NOW and UART links, radio arbitration
+    app_node/          node app, console, ESP-NOW and UART links, radio arbitration,
+                       optional SSD1306 status display (I2C, autodetected)
     app_udp_link/      WiFi UDP carrier
     app_nrf24_link/    nRF24L01+ carrier and register driver
   main/                app_main
